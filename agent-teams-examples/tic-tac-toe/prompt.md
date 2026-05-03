@@ -1,0 +1,1 @@
+Set up a team to create tic-tac-toe game - I need one agent exploring the architecture and another implementing changes
