@@ -361,6 +361,7 @@ function spawnBullet(x, y, vx, vy, damage, owner, bulletType, color, size, pierc
   b.type = bulletType || (owner === 'player' ? 'playerBullet' : 'enemyBullet');
   b.color = color || (owner === 'player' ? '#00ffff' : '#ff4444');
   b.size = size || (owner === 'player' ? 4 : 3);
+  b.width = b.size * 2; b.height = b.size * 2;
   b.alive = true;
   b.pierceCount = pierce || 0;
   return b;
@@ -451,6 +452,13 @@ function updatePlayer(dt) {
 
   // Invulnerability
   if (player.invulnerable) { player.invulnerableTimer -= dt; if (player.invulnerableTimer <= 0) player.invulnerable = false; }
+
+  // Auto-fire (always active while playing)
+  player.shootTimer -= dt;
+  if (player.shootTimer <= 0) {
+    playerShoot();
+    player.shootTimer = player.shootCooldown;
+  }
 
   // Shooting
   var isCharging = input.keys['Space'] || input.keys['KeyJ'] || (input.touches.length > 1);
