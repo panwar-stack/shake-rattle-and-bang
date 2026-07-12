@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 readonly DEFAULT_NAME="dev-vm"
-readonly DEFAULT_VCPUS="2"
-readonly DEFAULT_MEMORY_GIB="4"
+readonly DEFAULT_VCPUS="4"
+readonly DEFAULT_MEMORY_GIB="16"
 readonly DEFAULT_DISK_GIB="50"
+readonly DEFAULT_ROOT_DISK_GIB="30"
+readonly DEFAULT_MODEL="gemma3:4b"
+readonly OLLAMA_PORT="11434"
 readonly DEFAULT_REGION="us-east-1"
 readonly DEVICE_NAME="/dev/sdf"
 
@@ -23,6 +26,11 @@ SUBNET_ID=""
 SSH_CIDR=""
 PORT=""
 PORT_CIDR=""
+PORT_CIDR_EXPLICIT=0
+MODEL="$DEFAULT_MODEL"
+MODEL_EXPLICIT=0
+OLLAMA_CIDR=""
+OLLAMA_READY="0"
 YES=0
 NON_INTERACTIVE=0
 STATE_DIR="${AWS_VM_STATE_DIR:-$HOME/.aws-ec2-vm}"
@@ -56,6 +64,8 @@ SG_ID=""
 KEY_NAME=""
 KEY_PATH=""
 AMI_ID=""
+ROOT_DEVICE_NAME=""
+ROOT_DISK_GIB="$DEFAULT_ROOT_DISK_GIB"
 PUBLIC_IP=""
 PUBLIC_DNS=""
 VOLUME_TOKEN=""
@@ -72,7 +82,7 @@ shell_quote() { printf '%q' "$1"; }
 
 usage() {
   cat <<'EOF'
-aws-ec2-vm.sh - create and manage a small EC2 development VM
+aws-ec2-vm.sh - create and manage an Ollama EC2 VM
 
 USAGE
   aws-ec2-vm.sh setup [--profile PROFILE] [--region REGION]
@@ -86,12 +96,14 @@ USAGE
   aws-ec2-vm.sh destroy-storage [NAME] [--yes] [OPTIONS]
 
 CREATE OPTIONS
-  --vcpus N             Exact vCPU count (default: 2)
-  --memory GIB          Exact RAM in GiB (default: 4)
+  --vcpus N             Exact vCPU count (default: 4)
+  --memory GIB          Exact RAM in GiB (default: 16)
   --instance-type TYPE  Use this EC2 type instead of resolving vCPU/RAM
   --disk GIB            Persistent encrypted gp3 data disk (default: 50)
   --subnet-id ID        Subnet to use; otherwise a default subnet is selected
   --ssh-cidr CIDR       IPv4 CIDR allowed to SSH; default: your public IP /32
+  --model MODEL         Ollama model to pull and test (default: gemma3:4b)
+  --cidr CIDR           IPv4 CIDR allowed to reach Ollama; default: your public IP /32
 
 COMMON OPTIONS
   --profile PROFILE     AWS CLI profile (default: AWS_PROFILE or default)
@@ -111,11 +123,12 @@ SSH OPTIONS
   -- COMMAND [ARG...]   Run a remote command with arguments preserved safely
 
 PORT OPTIONS
-  --cidr CIDR           IPv4 CIDR allowed by expose-port; default: your public IP /32
+  --cidr CIDR           IPv4 CIDR allowed by create or expose-port; default: your public IP /32
 
 EXAMPLES
   ./aws-ec2-vm.sh setup
   ./aws-ec2-vm.sh create
+  ./aws-ec2-vm.sh create mlbox --model gemma3:4b
   ./aws-ec2-vm.sh create mlbox --vcpus 4 --memory 16 --disk 200
   ./aws-ec2-vm.sh status mlbox
   ./aws-ec2-vm.sh ssh mlbox
@@ -135,8 +148,9 @@ EXAMPLES
   ./aws-ec2-vm.sh destroy-storage mlbox # permanently deletes that volume
 
 STORAGE AND COST
-  The root disk is disposable. A separate encrypted EBS volume is attached with
-  DeleteOnTermination=false, so it survives reboot, stop, and termination.
+  The 30 GiB encrypted gp3 root disk is disposable. A separate encrypted EBS
+  volume is attached with DeleteOnTermination=false, so it survives reboot,
+  stop, and termination.
   EBS is tied to one Availability Zone; replacement VMs are created there.
   Stopped VMs and retained EBS volumes can still cost money. AWS also charges
   for public IPv4 while allocated. Public IPv4 may change after stop/start. The
@@ -202,7 +216,8 @@ parse_args() {
       --instance-type) need_value "$@"; INSTANCE_TYPE="$2"; shift 2 ;;
       --subnet-id) need_value "$@"; SUBNET_ID="$2"; shift 2 ;;
       --ssh-cidr) need_value "$@"; SSH_CIDR="$2"; shift 2 ;;
-      --cidr) need_value "$@"; PORT_CIDR="$2"; shift 2 ;;
+      --model) need_value "$@"; MODEL="$2"; MODEL_EXPLICIT=1; shift 2 ;;
+      --cidr) need_value "$@"; PORT_CIDR="$2"; PORT_CIDR_EXPLICIT=1; shift 2 ;;
       --forward-agent) SSH_FORWARD_AGENT=1; shift ;;
       --tty) SSH_TTY=1; shift ;;
       --mount-dir) need_value "$@"; MOUNT_DIR="$2"; MOUNT_DIR_EXPLICIT=1; shift 2 ;;
@@ -226,6 +241,7 @@ validate_args() {
   case "$REGION" in *[!a-z0-9-]*) [ -z "$REGION" ] || die "invalid region: $REGION" ;; esac
   case "$PROFILE" in ''|*[!a-zA-Z0-9_+=,.@-]*) die "invalid profile name" ;; esac
   [ -z "$SSH_CIDR" ] || valid_cidr "$SSH_CIDR" || die "invalid IPv4 CIDR: $SSH_CIDR"
+  [[ "$MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$ ]] || die "invalid Ollama model: $MODEL"
   if [ "$COMMAND" = "expose-port" ] || [ "$COMMAND" = "close-port" ]; then
     is_uint "$PORT" || die "PORT must be an integer from 1 to 65535"
     case "$PORT" in 0*) die "PORT must not have leading zeros" ;; esac
@@ -233,7 +249,8 @@ validate_args() {
     [ "$PORT" -ne 22 ] || die "port 22 is managed as SSH access; use create --ssh-cidr to configure it"
   fi
   [ -z "$PORT_CIDR" ] || valid_cidr "$PORT_CIDR" || die "invalid IPv4 CIDR: $PORT_CIDR"
-  [ "$COMMAND" = "expose-port" ] || [ -z "$PORT_CIDR" ] || die "--cidr is supported only by expose-port"
+  [ "$COMMAND" = "expose-port" ] || [ "$COMMAND" = "create" ] || [ -z "$PORT_CIDR" ] || die "--cidr is supported only by create and expose-port"
+  [ "$COMMAND" = "create" ] || [ "$MODEL_EXPLICIT" -eq 0 ] || die "--model is supported only by create"
   if [ "$MOUNT_DIR_EXPLICIT" -eq 1 ]; then
     [ -n "$MOUNT_DIR" ] || die "--mount-dir requires a non-empty path"
     case "$MOUNT_DIR" in *[[:cntrl:]]*) die "--mount-dir must not contain control characters" ;; esac
@@ -292,7 +309,7 @@ save_state() {
   local tmp="$STATE_FILE.tmp.$$" key value
   umask 077
   : > "$tmp"
-  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID INSTANCE_TYPE DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY; do
+  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID INSTANCE_TYPE DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_CIDR OLLAMA_READY; do
     eval "value=\${$key}"
     case "$value" in *$'\n'*|*$'\r'*) rm -f "$tmp"; die "state value contains a newline" ;; esac
     printf '%s=%s\n' "$key" "$value" >> "$tmp"
@@ -325,6 +342,9 @@ load_state() {
       VOLUME_TOKEN) VOLUME_TOKEN="$value" ;;
       INSTANCE_TOKEN) INSTANCE_TOKEN="$value" ;;
       INSTANCE_READY) INSTANCE_READY="$value" ;;
+      MODEL) [ "$MODEL_EXPLICIT" -eq 1 ] || MODEL="$value" ;;
+      OLLAMA_CIDR) OLLAMA_CIDR="$value" ;;
+      OLLAMA_READY) OLLAMA_READY="$value" ;;
       '') ;;
       *) die "unknown field in state file: $key" ;;
     esac
@@ -338,6 +358,9 @@ load_state() {
   case "$SG_ID" in ''|sg-[a-zA-Z0-9]*) ;; *) die "invalid security group ID in state" ;; esac
   case "$INSTANCE_READY" in 0|1) ;; *) die "invalid readiness marker in state" ;; esac
   is_uint "$DISK_GIB" || die "invalid disk size in state"
+  [[ "$MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$ ]] || die "invalid Ollama model in state"
+  [ -z "$OLLAMA_CIDR" ] || valid_cidr "$OLLAMA_CIDR" || die "invalid Ollama CIDR in state"
+  case "$OLLAMA_READY" in 0|1) ;; *) die "invalid Ollama readiness marker in state" ;; esac
 }
 
 release_mount_path_lock() {
@@ -695,9 +718,16 @@ ensure_volume() {
 }
 
 resolve_ami() {
-  [ -z "$AMI_ID" ] || return 0
-  AMI_ID="$(aws_text ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value)"
+  if [ -z "$AMI_ID" ]; then
+    AMI_ID="$(aws_text ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value)"
+  fi
   [ -n "$AMI_ID" ] && [ "$AMI_ID" != "None" ] || die "could not resolve Amazon Linux 2023 AMI"
+  ROOT_DEVICE_NAME="$(aws_text ec2 describe-images --image-ids "$AMI_ID" --query 'Images[0].RootDeviceName')"
+  [[ "$ROOT_DEVICE_NAME" =~ ^/dev/[a-zA-Z0-9._-]+$ ]] || die "AMI $AMI_ID has an invalid root device"
+  local ami_root_disk_gib
+  ami_root_disk_gib="$(aws_text ec2 describe-images --image-ids "$AMI_ID" --query "Images[0].BlockDeviceMappings[?DeviceName=='$ROOT_DEVICE_NAME'].Ebs.VolumeSize | [0]")"
+  is_uint "$ami_root_disk_gib" || die "AMI $AMI_ID has an invalid root volume size"
+  if [ "$ami_root_disk_gib" -gt "$ROOT_DISK_GIB" ]; then ROOT_DISK_GIB="$ami_root_disk_gib"; fi
 }
 
 create_instance() {
@@ -714,7 +744,7 @@ create_instance() {
   fi
   if [ -z "$INSTANCE_ID" ]; then
     if [ -z "$INSTANCE_TOKEN" ]; then INSTANCE_TOKEN="i-$ACCOUNT_ID-$(date +%s)-$$"; save_state; fi
-    INSTANCE_ID="$(aws_text ec2 run-instances --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --count 1 --subnet-id "$SUBNET_ID" --security-group-ids "$SG_ID" --key-name "$KEY_NAME" --associate-public-ip-address --metadata-options HttpEndpoint=enabled,HttpTokens=required --instance-initiated-shutdown-behavior stop --client-token "$INSTANCE_TOKEN" --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"DeleteOnTermination":true,"VolumeType":"gp3"}}]' --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ManagedBy,Value=aws-ec2-vm}]" --query 'Instances[0].InstanceId')"
+    INSTANCE_ID="$(aws_text ec2 run-instances --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --count 1 --subnet-id "$SUBNET_ID" --security-group-ids "$SG_ID" --key-name "$KEY_NAME" --associate-public-ip-address --metadata-options HttpEndpoint=enabled,HttpTokens=required --instance-initiated-shutdown-behavior stop --client-token "$INSTANCE_TOKEN" --block-device-mappings "[{\"DeviceName\":\"$ROOT_DEVICE_NAME\",\"Ebs\":{\"DeleteOnTermination\":true,\"Encrypted\":true,\"VolumeType\":\"gp3\",\"VolumeSize\":$ROOT_DISK_GIB}}]" --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ManagedBy,Value=aws-ec2-vm}]" --query 'Instances[0].InstanceId')"
     save_state
     info "Created instance $INSTANCE_ID"
   fi
@@ -733,8 +763,6 @@ create_instance() {
   info "Waiting for EC2 health checks"
   "${AWS[@]}" ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
   refresh_public_ip
-  INSTANCE_READY="1"
-  save_state
 }
 
 refresh_public_ip() {
@@ -771,6 +799,129 @@ PERSISTENT STORAGE
 EOF
 }
 
+configure_ollama_cidr() {
+  PORT="$OLLAMA_PORT"
+  [ -n "$PORT_CIDR" ] || PORT_CIDR="$OLLAMA_CIDR"
+  discover_port_cidr
+  OLLAMA_CIDR="$PORT_CIDR"
+}
+
+ollama_rules() {
+  aws_text ec2 describe-security-group-rules --filters "Name=group-id,Values=$SG_ID" \
+    --query "SecurityGroupRules[?IpProtocol==\`tcp\` && FromPort==\`$OLLAMA_PORT\` && ToPort==\`$OLLAMA_PORT\`].[SecurityGroupRuleId,CidrIpv4,Description]"
+}
+
+ensure_ollama_ingress() {
+  local rules owned_desired any_desired stale id remaining
+  local description="aws-ec2-vm:${NAME}:ollama:${OLLAMA_PORT}"
+  rules="$(ollama_rules)" || die "cannot inspect Ollama port rules in $SG_ID"
+  owned_desired="$(awk -F '\t' -v cidr="$OLLAMA_CIDR" -v description="$description" '$2 == cidr && $3 == description { print $1 }' <<< "$rules")"
+  any_desired="$(awk -F '\t' -v cidr="$OLLAMA_CIDR" '$2 == cidr { print $1 }' <<< "$rules")"
+  if [ -z "$owned_desired" ] && [ -n "$any_desired" ]; then
+    die "Ollama port $OLLAMA_PORT for $OLLAMA_CIDR already exists in an unowned rule; refusing to adopt or modify it"
+  fi
+  if [ -z "$owned_desired" ]; then
+    if ! aws_text ec2 authorize-security-group-ingress --group-id "$SG_ID" --ip-permissions "IpProtocol=tcp,FromPort=$OLLAMA_PORT,ToPort=$OLLAMA_PORT,IpRanges=[{CidrIp=$OLLAMA_CIDR,Description=$description}]" >/dev/null; then
+      rules="$(ollama_rules)" || die "cannot inspect Ollama rules after authorize failed"
+      owned_desired="$(awk -F '\t' -v cidr="$OLLAMA_CIDR" -v description="$description" '$2 == cidr && $3 == description { print $1 }' <<< "$rules")"
+      [ -n "$owned_desired" ] || die "could not expose Ollama port $OLLAMA_PORT to $OLLAMA_CIDR"
+    fi
+  fi
+  rules="$(ollama_rules)" || die "cannot verify Ollama port rules"
+  owned_desired="$(awk -F '\t' -v cidr="$OLLAMA_CIDR" -v description="$description" '$2 == cidr && $3 == description { print $1 }' <<< "$rules")"
+  [ -n "$owned_desired" ] || die "new Ollama port rule could not be verified"
+  stale="$(awk -F '\t' -v cidr="$OLLAMA_CIDR" -v description="$description" '$2 != cidr && $3 == description { print $1 }' <<< "$rules")"
+  for id in $stale; do
+    if ! aws_text ec2 revoke-security-group-ingress --group-id "$SG_ID" --security-group-rule-ids "$id" >/dev/null; then
+      remaining="$(ollama_rules)" || die "cannot inspect Ollama rules after revoke failed"
+      if awk -F '\t' -v id="$id" '$1 == id { found=1 } END { exit !found }' <<< "$remaining"; then
+        die "could not revoke managed Ollama security group rule $id"
+      fi
+    fi
+  done
+  info "Ollama port $OLLAMA_PORT is exposed to $OLLAMA_CIDR"
+}
+
+ensure_ollama_remote() {
+  prepare_ssh_endpoint
+  build_ssh_args
+  info "Ensuring Ollama service and model $MODEL"
+  # The model argument is passed separately and interpreted only as data remotely.
+  # shellcheck disable=SC2029
+  ssh "${SSH_ARGS[@]}" "ec2-user@$PUBLIC_IP" "sudo -n /bin/bash -s -- $(shell_quote "$MODEL")" <<'REMOTE_OLLAMA' || die "Ollama provisioning failed on $INSTANCE_ID"
+set -Eeuo pipefail
+model="$1"
+
+[ "$(uname -m)" = "x86_64" ] || { printf 'Error: Ollama provisioning requires x86_64\n' >&2; exit 1; }
+. /etc/os-release
+[ "${ID:-}" = "amzn" ] && [ "${VERSION_ID:-}" = "2023" ] || {
+  printf 'Error: Ollama provisioning requires Amazon Linux 2023\n' >&2
+  exit 1
+}
+
+if ! command -v ollama >/dev/null 2>&1 || ! systemctl cat ollama.service >/dev/null 2>&1; then
+  command -v zstd >/dev/null 2>&1 || dnf install -y zstd
+  tmp="$(mktemp /tmp/ollama-install.XXXXXX)"
+  trap 'rm -f -- "$tmp"' EXIT
+  curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp" https://ollama.com/install.sh
+  /bin/sh "$tmp"
+  rm -f -- "$tmp"
+  trap - EXIT
+fi
+
+install -d -o root -g root -m 0755 /etc/systemd/system/ollama.service.d
+cat > /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf <<'EOF'
+[Service]
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+EOF
+chown root:root /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf
+chmod 0644 /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf
+systemctl daemon-reload
+systemctl enable --now ollama.service
+systemctl restart ollama.service
+
+ready=0
+for attempt in $(seq 1 30); do
+  if curl -fsS --max-time 5 http://127.0.0.1:11434/api/tags >/dev/null; then
+    ready=1
+    break
+  fi
+  [ "$attempt" -eq 30 ] || sleep 2
+done
+[ "$ready" -eq 1 ] || { printf 'Error: Ollama API did not become ready\n' >&2; exit 1; }
+
+if ! ollama list | awk 'NR > 1 { print $1 }' | grep -Fxq -- "$model"; then
+  ollama pull "$model"
+fi
+response="$(mktemp /tmp/ollama-smoke.XXXXXX)"
+trap 'rm -f -- "$response"' EXIT
+printf '{"model":"%s","prompt":"Reply with OK.","stream":false}' "$model" |
+  curl -fsS --max-time 300 -H 'Content-Type: application/json' --data-binary @- -o "$response" http://127.0.0.1:11434/api/generate
+grep -q '"response"' "$response" || { printf 'Error: Ollama smoke test returned an invalid response\n' >&2; exit 1; }
+REMOTE_OLLAMA
+}
+
+print_ollama_endpoint() {
+  printf 'Ollama public IP: %s\nOllama port:      %s\nOllama CIDR:      %s\nOllama model:     %s\nOllama endpoint:  http://%s:%s\n' \
+    "$PUBLIC_IP" "$OLLAMA_PORT" "$OLLAMA_CIDR" "$MODEL" "$PUBLIC_IP" "$OLLAMA_PORT"
+}
+
+ensure_ollama() {
+  if [ -z "$OLLAMA_CIDR" ] || { [ "$PORT_CIDR_EXPLICIT" -eq 1 ] && [ "$PORT_CIDR" != "$OLLAMA_CIDR" ]; }; then
+    configure_ollama_cidr
+  else
+    PORT="$OLLAMA_PORT"
+    PORT_CIDR="$OLLAMA_CIDR"
+  fi
+  save_state
+  validate_port_security_group "$(instance_state)"
+  ensure_ollama_remote
+  ensure_ollama_ingress
+  OLLAMA_READY="1"
+  save_state
+  print_ollama_endpoint
+}
+
 create_vm() {
   mkdir -p "$STATE_DIR"
   if [ -f "$STATE_FILE" ]; then load_state; fi
@@ -783,7 +934,16 @@ create_vm() {
     local existing_state
     existing_state="$(instance_state)"
     case "$existing_state" in
-      pending|running|stopping|stopped)
+      running)
+        if [ "$OLLAMA_READY" = "0" ]; then
+          info "Resuming Ollama setup for $INSTANCE_ID"
+          ensure_ollama
+          print_commands
+          return
+        fi
+        die "VM '$NAME' already exists as $INSTANCE_ID ($existing_state); use '$0 status $NAME' instead"
+        ;;
+      pending|stopping|stopped)
         die "VM '$NAME' already exists as $INSTANCE_ID ($existing_state); use '$0 status $NAME' instead"
         ;;
       shutting-down) die "VM '$NAME' is shutting down; wait, then run create again to reuse its storage" ;;
@@ -791,6 +951,7 @@ create_vm() {
       *) die "cannot safely create: recorded instance $INSTANCE_ID is $existing_state" ;;
     esac
   fi
+  configure_ollama_cidr
   discover_ssh_cidr
   info "Resolving VPC, subnet, and Availability Zone"
   resolve_existing_volume
@@ -806,6 +967,9 @@ create_vm() {
   info "Preparing persistent EBS storage"
   ensure_volume
   create_instance
+  ensure_ollama
+  INSTANCE_READY="1"
+  save_state
   print_commands
   print_disk_instructions
   warn "The root disk is disposable. Data on $VOLUME_ID persists and continues to incur EBS charges."
@@ -948,6 +1112,7 @@ start_vm() {
     *) die "instance is $state; wait and retry" ;;
   esac
   refresh_public_ip
+  ensure_ollama
   print_commands
 }
 
@@ -2011,6 +2176,7 @@ terminate_vm() {
   PUBLIC_IP=""
   PUBLIC_DNS=""
   INSTANCE_READY="0"
+  OLLAMA_READY="0"
   save_state
   info "Instance terminated. Persistent volume retained: $VOLUME_ID"
   printf 'Recreate in %s with: %q create %q\n' "$AZ" "$0" "$NAME"
