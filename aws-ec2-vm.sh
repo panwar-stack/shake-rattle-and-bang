@@ -1280,7 +1280,7 @@ prove_blank() {
   mapfile -t nodes < <(lsblk -nrpo NAME,TYPE -- "$disk")
   [ "${#nodes[@]}" -eq 1 ] || die "blank initialization requires a whole disk with no partitions or children"
   [ "${nodes[0]}" = "$disk disk" ] || die "unexpected node below candidate disk"
-  signature="$(wipefs -n --noheadings -o TYPE -- "$disk" 2>/dev/null)" || die "wipefs could not safely inspect $disk"
+  signature="$(wipefs -n --noheadings --output TYPE -- "$disk" 2>/dev/null)" || die "wipefs could not safely inspect $disk"
   [ -z "${signature//[[:space:]]/}" ] || die "candidate disk contains a signature; refusing to format"
 }
 
@@ -1577,7 +1577,8 @@ install_verified_sshfs() {
   pkg_path="/usr/local/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
   PKG_CONFIG_PATH="$pkg_path" meson setup "$tmp/build" "$tmp/sshfs-$SSHFS_VERSION" --prefix="$HOME/.local" --buildtype=release
   PKG_CONFIG_PATH="$pkg_path" meson compile -C "$tmp/build"
-  PKG_CONFIG_PATH="$pkg_path" meson install -C "$tmp/build"
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 "$tmp/build/sshfs" "$HOME/.local/bin/sshfs"
   trap - RETURN
   rm -rf -- "$tmp"
   SSHFS_BIN="$HOME/.local/bin/sshfs"
