@@ -22,7 +22,7 @@ OPTIONS
   --region REGION         Select an AWS region
   --auth MODE             GitHub auth: agent (default), device, or public
   --clone OWNER/REPO      Clone a repository after setup
-  --clone-dir REMOTE_PATH Clone destination (default: ~/src/REPO)
+  --clone-dir REMOTE_PATH Clone destination (default: /data/workspace/REPO)
   -h, --help              Show help
 
 AUTH MODES
@@ -33,7 +33,7 @@ AUTH MODES
 EXAMPLES
   ./github-vm-setup.sh mlbox --clone octocat/Hello-World
   ./github-vm-setup.sh mlbox --auth device --clone OWNER/private-repo
-  ./github-vm-setup.sh mlbox --auth public --clone-dir projects/demo --clone OWNER/REPO
+  ./github-vm-setup.sh mlbox --auth public --clone-dir /data/workspace/demo --clone OWNER/REPO
 
 Device mode stores the GitHub CLI token on the VM's disposable root disk. Agent
 forwarding lets the VM use the local agent only while SSH is connected; use it
@@ -96,6 +96,13 @@ run_vm() {
   "${args[@]}" "$@"
 }
 
+prepare_vm() {
+  local args=("$VM_TOOL" prepare "$VM_NAME")
+  [ -z "$PROFILE" ] || args+=(--profile "$PROFILE")
+  [ -z "$REGION" ] || args+=(--region "$REGION")
+  "${args[@]}"
+}
+
 main() {
   parse_args "$@"
   validate_args
@@ -104,6 +111,8 @@ main() {
   script_dir="$(cd "$(dirname "$0")" && pwd)"
   readonly VM_TOOL="$script_dir/aws-ec2-vm.sh"
   [ -x "$VM_TOOL" ] || die "VM helper is not executable: $VM_TOOL"
+
+  prepare_vm
 
   run_vm -- bash -s -- "$AUTH_MODE" <<'REMOTE_BOOTSTRAP'
 set -Eeuo pipefail
@@ -159,7 +168,7 @@ auth_mode="$1"
 slug="$2"
 dest="$3"
 repo="${slug#*/}"
-[ -n "$dest" ] || dest="$HOME/src/$repo"
+[ -n "$dest" ] || dest="/data/workspace/$repo"
 [ ! -e "$dest" ] || { printf 'Error: clone destination already exists: %s\n' "$dest" >&2; exit 1; }
 mkdir -p -- "$(dirname -- "$dest")"
 case "$auth_mode" in
@@ -182,6 +191,9 @@ REMOTE_CLONE
   fi
 
   printf 'GitHub setup complete for VM %s (%s mode).\n' "$VM_NAME" "$AUTH_MODE"
+  if [ -n "$CLONE_SLUG" ]; then
+    printf 'Repository: %s\n' "${CLONE_DIR:-/data/workspace/${CLONE_SLUG#*/}}"
+  fi
   if [ "$AUTH_MODE" = "device" ]; then
     local logout_args=("$VM_TOOL" ssh "$VM_NAME") arg
     [ -z "$PROFILE" ] || logout_args+=(--profile "$PROFILE")
