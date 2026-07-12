@@ -26,6 +26,10 @@ NON_INTERACTIVE=0
 STATE_DIR="${AWS_VM_STATE_DIR:-$HOME/.aws-ec2-vm}"
 STATE_FILE=""
 AWS=()
+SSH_FORWARD_AGENT=0
+SSH_TTY=0
+SSH_REMOTE_COMMAND=()
+SSH_KNOWN_HOSTS=""
 
 # State fields. These are written after every resource-creating operation.
 ACCOUNT_ID=""
@@ -73,12 +77,18 @@ COMMON OPTIONS
   --non-interactive     Never prompt; fail when input/authentication is needed
   -h, --help            Show help
 
+SSH OPTIONS
+  --forward-agent       Forward the local SSH agent for this connection
+  --tty                 Force pseudo-terminal allocation
+  -- COMMAND [ARG...]   Run a remote command with arguments preserved safely
+
 EXAMPLES
   ./aws-ec2-vm.sh setup
   ./aws-ec2-vm.sh create
   ./aws-ec2-vm.sh create mlbox --vcpus 4 --memory 16 --disk 200
   ./aws-ec2-vm.sh status mlbox
   ./aws-ec2-vm.sh ssh mlbox
+  ./aws-ec2-vm.sh ssh mlbox --forward-agent -- git status
   ./aws-ec2-vm.sh stop mlbox
   ./aws-ec2-vm.sh start mlbox
   ./aws-ec2-vm.sh terminate mlbox       # keeps mlbox's data EBS volume
@@ -132,6 +142,13 @@ parse_args() {
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --)
+        [ "$COMMAND" = "ssh" ] || die "-- COMMAND is supported only by ssh"
+        shift
+        [ "$#" -gt 0 ] || die "-- requires a remote command"
+        SSH_REMOTE_COMMAND=("$@")
+        break
+        ;;
       --profile) need_value "$@"; PROFILE="$2"; PROFILE_EXPLICIT=1; shift 2 ;;
       --region) need_value "$@"; REGION="$2"; REGION_EXPLICIT=1; shift 2 ;;
       --vcpus) need_value "$@"; VCPUS="$2"; shift 2 ;;
@@ -140,6 +157,8 @@ parse_args() {
       --instance-type) need_value "$@"; INSTANCE_TYPE="$2"; shift 2 ;;
       --subnet-id) need_value "$@"; SUBNET_ID="$2"; shift 2 ;;
       --ssh-cidr) need_value "$@"; SSH_CIDR="$2"; shift 2 ;;
+      --forward-agent) SSH_FORWARD_AGENT=1; shift ;;
+      --tty) SSH_TTY=1; shift ;;
       --yes) YES=1; shift ;;
       --non-interactive) NON_INTERACTIVE=1; shift ;;
       -h|--help) COMMAND="help"; shift ;;
@@ -158,6 +177,9 @@ validate_args() {
   case "$REGION" in *[!a-z0-9-]*) [ -z "$REGION" ] || die "invalid region: $REGION" ;; esac
   case "$PROFILE" in ''|*[!a-zA-Z0-9_+=,.@-]*) die "invalid profile name" ;; esac
   [ -z "$SSH_CIDR" ] || valid_cidr "$SSH_CIDR" || die "invalid IPv4 CIDR: $SSH_CIDR"
+  if [ "$COMMAND" != "ssh" ] && { [ "$SSH_FORWARD_AGENT" -eq 1 ] || [ "$SSH_TTY" -eq 1 ] || [ "${#SSH_REMOTE_COMMAND[@]}" -gt 0 ]; }; then
+    die "SSH options are supported only by ssh"
+  fi
 }
 
 valid_cidr() {
@@ -222,7 +244,8 @@ load_state() {
   [ "$PROFILE_EXPLICIT" -eq 0 ] || [ "$PROFILE" = "$saved_profile" ] || die "state uses profile '$saved_profile', not requested '$PROFILE'"
   [ "$REGION_EXPLICIT" -eq 0 ] || [ "$REGION" = "$saved_region" ] || die "state uses region '$saved_region', not requested '$REGION'"
   PROFILE="$saved_profile"; REGION="$saved_region"
-  case "$INSTANCE_ID" in ''|i-[a-zA-Z0-9]*) ;; *) die "invalid instance ID in state" ;; esac
+  case "$INSTANCE_ID" in ''|i-*) ;; *) die "invalid instance ID in state" ;; esac
+  case "${INSTANCE_ID#i-}" in ''|*[!a-zA-Z0-9]*) [ -z "$INSTANCE_ID" ] || die "invalid instance ID in state" ;; esac
   case "$VOLUME_ID" in ''|vol-[a-zA-Z0-9]*) ;; *) die "invalid volume ID in state" ;; esac
   case "$SG_ID" in ''|sg-[a-zA-Z0-9]*) ;; *) die "invalid security group ID in state" ;; esac
   case "$INSTANCE_READY" in 0|1) ;; *) die "invalid readiness marker in state" ;; esac
@@ -494,13 +517,12 @@ resolve_ami() {
 create_instance() {
   local prior_state="" attachment=""
   if [ -n "$INSTANCE_ID" ]; then
-    prior_state="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name')" || die "cannot inspect recorded instance $INSTANCE_ID"
+    prior_state="$(instance_state)"
     case "$prior_state" in
-      terminated) INSTANCE_ID=""; INSTANCE_TOKEN=""; INSTANCE_READY="0"; PUBLIC_IP=""; save_state ;;
+      terminated|not-found|None|'') INSTANCE_ID=""; INSTANCE_TOKEN=""; INSTANCE_READY="0"; PUBLIC_IP=""; save_state ;;
       pending|running) info "Resuming setup for $INSTANCE_ID ($prior_state)" ;;
       stopped) info "Starting partial instance $INSTANCE_ID to finish setup"; aws_text ec2 start-instances --instance-ids "$INSTANCE_ID" --query 'StartingInstances[0].CurrentState.Name' >/dev/null ;;
       shutting-down|stopping) die "instance $INSTANCE_ID is $prior_state; wait and retry" ;;
-      None|'') die "recorded instance $INSTANCE_ID was not found; inspect state before retrying" ;;
       *) die "instance $INSTANCE_ID is $prior_state; cannot resume" ;;
     esac
   fi
@@ -539,11 +561,7 @@ print_commands() {
   local script
   script="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   printf '\nVM: %s  Instance: %s  Persistent EBS: %s  AZ: %s\n' "$NAME" "${INSTANCE_ID:-none}" "${VOLUME_ID:-none}" "${AZ:-unknown}"
-  if [ -n "$PUBLIC_IP" ] && [ -f "$KEY_PATH" ]; then
-    printf 'SSH:       ssh -i '; shell_quote "$KEY_PATH"; printf ' ec2-user@%s\n' "$PUBLIC_IP"
-  else
-    printf 'SSH:       %q ssh %q\n' "$script" "$NAME"
-  fi
+  printf 'SSH:       %q ssh %q\n' "$script" "$NAME"
   printf 'Status:    %q status %q\n' "$script" "$NAME"
   printf 'Stop:      %q stop %q\n' "$script" "$NAME"
   printf 'Start:     %q start %q\n' "$script" "$NAME"
@@ -672,6 +690,105 @@ restart_vm() {
   print_commands
 }
 
+authenticated_console_output() {
+  aws_text ec2 get-console-output --instance-id "$INSTANCE_ID" --latest --query Output 2>/dev/null ||
+    aws_text ec2 get-console-output --instance-id "$INSTANCE_ID" --query Output 2>/dev/null
+}
+
+valid_ssh_host_key() {
+  local key_type="$1" key_data="$2" key_file="$4"
+  case "$key_type" in ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) ;; *) return 1 ;; esac
+  case "$key_data" in ''|*[!A-Za-z0-9+/=]*) return 1 ;; esac
+  printf '%s %s\n' "$key_type" "$key_data" > "$key_file"
+  ssh-keygen -l -f "$key_file" >/dev/null 2>&1
+}
+
+write_console_host_keys() {
+  local keys="$1" target="$2" key_file="$3"
+  local key_type key_data extra count=0
+  : > "$target"
+  while IFS=' ' read -r key_type key_data extra; do
+    valid_ssh_host_key "$key_type" "$key_data" "$extra" "$key_file" || return 1
+    printf '%s %s %s\n' "$PUBLIC_IP" "$key_type" "$key_data" >> "$target"
+    count=$((count + 1))
+  done < "$keys"
+  [ "$count" -gt 0 ]
+}
+
+write_cached_host_keys() {
+  local cache="$1" target="$2" key_file="$3"
+  local cached_host first_host="" key_type key_data extra count=0
+  [ ! -L "$cache" ] && [ -f "$cache" ] && [ -O "$cache" ] || return 1
+  : > "$target"
+  while IFS=' ' read -r cached_host key_type key_data extra; do
+    valid_cidr "$cached_host/32" || return 1
+    [ -z "$first_host" ] || [ "$cached_host" = "$first_host" ] || return 1
+    first_host="$cached_host"
+    valid_ssh_host_key "$key_type" "$key_data" "$extra" "$key_file" || return 1
+    printf '%s %s %s\n' "$PUBLIC_IP" "$key_type" "$key_data" >> "$target"
+    count=$((count + 1))
+  done < "$cache"
+  [ "$count" -gt 0 ]
+}
+
+prepare_ssh_known_hosts() {
+  command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required"
+  valid_cidr "$PUBLIC_IP/32" || die "AWS returned an invalid public IPv4 address for $INSTANCE_ID"
+  local host_dir="$STATE_DIR/known_hosts" cache work output attempt complete=0
+  [ ! -L "$host_dir" ] || die "refusing symlinked known-hosts directory: $host_dir"
+  [ ! -e "$host_dir" ] || [ -d "$host_dir" ] || die "known-hosts path is not a directory: $host_dir"
+  mkdir -p "$host_dir"
+  [ -O "$host_dir" ] || die "known-hosts directory is not owned by the current user: $host_dir"
+  chmod 700 "$host_dir"
+  umask 077
+  work="$(mktemp -d "$host_dir/.verify-$INSTANCE_ID.XXXXXX")"
+  cache="$host_dir/$INSTANCE_ID"
+  attempt=1
+  while [ "$attempt" -le 24 ]; do
+    if output="$(authenticated_console_output)" &&
+      printf '%s\n' "$output" | awk '
+        BEGIN { inside = 0; seen = 0; bad = 0 }
+        { sub(/\r$/, "") }
+        $0 == "-----BEGIN SSH HOST KEY KEYS-----" {
+          if (inside || seen) bad = 1
+          inside = 1
+          next
+        }
+        $0 == "-----END SSH HOST KEY KEYS-----" {
+          if (!inside) bad = 1
+          inside = 0
+          seen = 1
+          next
+        }
+        inside { print }
+        END { if (inside || !seen || bad) exit 1 }
+      ' > "$work/keys"; then
+      if ! write_console_host_keys "$work/keys" "$work/known_hosts" "$work/key"; then
+        rm -rf "$work"
+        die "EC2 console output for $INSTANCE_ID contained malformed or invalid SSH host keys"
+      fi
+      complete=1
+      break
+    fi
+    if write_cached_host_keys "$cache" "$work/known_hosts" "$work/key"; then
+      info "Reusing authenticated cached SSH host keys for $INSTANCE_ID"
+      complete=1
+      break
+    fi
+    [ "$attempt" -ne 1 ] || info "Waiting for authenticated EC2 console SSH host keys"
+    [ "$attempt" -eq 24 ] || sleep 5
+    attempt=$((attempt + 1))
+  done
+  if [ "$complete" -ne 1 ]; then
+    rm -rf "$work"
+    die "no authenticated console SSH host keys or valid cache exist for $INSTANCE_ID"
+  fi
+  chmod 600 "$work/known_hosts"
+  SSH_KNOWN_HOSTS="$cache"
+  mv -f "$work/known_hosts" "$SSH_KNOWN_HOSTS"
+  rm -rf "$work"
+}
+
 ssh_vm() {
   prepare_existing
   local state
@@ -680,9 +797,29 @@ ssh_vm() {
   refresh_public_ip
   [ -n "$PUBLIC_IP" ] || die "instance has no public IPv4 address; check subnet routing or use AWS Systems Manager"
   [ -f "$KEY_PATH" ] || die "private key missing: $KEY_PATH"
+  prepare_ssh_known_hosts
   release_lock
   trap - EXIT INT TERM HUP
-  exec ssh -o StrictHostKeyChecking=accept-new -i "$KEY_PATH" "ec2-user@$PUBLIC_IP"
+  local forward_agent=no
+  [ "$SSH_FORWARD_AGENT" -eq 0 ] || forward_agent=yes
+  local ssh_args=(
+    -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS"
+    -o GlobalKnownHostsFile=/dev/null
+    -o KnownHostsCommand=none
+    -o UpdateHostKeys=no
+    -o "ForwardAgent=$forward_agent"
+    -i "$KEY_PATH"
+  ) remote_command="" quoted arg
+  [ "$SSH_TTY" -eq 0 ] || ssh_args+=(-tt)
+  if [ "${#SSH_REMOTE_COMMAND[@]}" -gt 0 ]; then
+    for arg in "${SSH_REMOTE_COMMAND[@]}"; do
+      printf -v quoted '%q' "$arg"
+      remote_command+="${remote_command:+ }$quoted"
+    done
+    exec ssh "${ssh_args[@]}" "ec2-user@$PUBLIC_IP" "$remote_command"
+  fi
+  exec ssh "${ssh_args[@]}" "ec2-user@$PUBLIC_IP"
 }
 
 confirm() {
