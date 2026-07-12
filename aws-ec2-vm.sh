@@ -1891,7 +1891,7 @@ mount_storage() {
   assert_mountpoint_not_claimed
   prepare_storage
   ensure_sshfs
-  local alias source ssh_config lines
+  local alias source ssh_config lines sshfs_log sshfs_pid attempt mounted=0
   alias="aws-ec2-vm-$NAME-$INSTANCE_ID"
   source="$alias:/data"
   if [ -e "$MOUNT_CONFIG" ] || [ -L "$MOUNT_CONFIG" ]; then
@@ -1907,12 +1907,29 @@ mount_storage() {
   lines="$(mount_lines_for_target "$MOUNT_DIR")"
   [ -z "$lines" ] || die "$MOUNT_DIR is already mounted but is not the exact healthy mount for $NAME; use unmount --force only if its marker read is unresponsive"
   ssh_config="$(write_sshfs_config)"
-  "$SSHFS_BIN" -F "$ssh_config" "$source" "$MOUNT_DIR" -o reconnect -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-    -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=yes -o contain_symlinks -o nodev -o nosuid
-  if ! managed_mount_line "$source" "$MOUNT_DIR" || ! mount_health_ok "$MOUNT_DIR" "$NAME" "$INSTANCE_ID" "$VOLUME_ID" "$STORAGE_UUID"; then
-    warn "SSHFS mounted but failed exact source/type/marker verification; attempting normal unmount"
-    /sbin/umount "$MOUNT_DIR" >/dev/null 2>&1 || true
-    die "SSHFS mount verification failed"
+  sshfs_log="$STATE_DIR/sshfs/$NAME-$INSTANCE_ID.log"
+  umask 077
+  : > "$sshfs_log"
+  chmod 600 "$sshfs_log"
+  nohup "$SSHFS_BIN" -f -F "$ssh_config" "$source" "$MOUNT_DIR" -o reconnect -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+    -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=yes -o contain_symlinks -o nodev -o nosuid \
+    > "$sshfs_log" 2>&1 < /dev/null &
+  sshfs_pid=$!
+  for attempt in $(seq 1 20); do
+    if managed_mount_line "$source" "$MOUNT_DIR" && mount_health_ok "$MOUNT_DIR" "$NAME" "$INSTANCE_ID" "$VOLUME_ID" "$STORAGE_UUID"; then
+      mounted=1
+      break
+    fi
+    kill -0 "$sshfs_pid" 2>/dev/null || break
+    sleep 1
+  done
+  if [ "$mounted" -ne 1 ]; then
+    kill "$sshfs_pid" 2>/dev/null || true
+    wait "$sshfs_pid" 2>/dev/null || true
+    if managed_mount_line "$source" "$MOUNT_DIR"; then
+      /sbin/umount "$MOUNT_DIR" >/dev/null 2>&1 || true
+    fi
+    die "SSHFS did not produce a healthy mount; inspect $sshfs_log. If macFUSE was just installed, approve it in System Settings > Privacy & Security, restart your Mac, and retry"
   fi
   if ! save_mount_config "$source" "$ssh_config"; then
     warn "Could not save durable mount ownership metadata; attempting normal unmount"
