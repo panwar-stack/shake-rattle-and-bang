@@ -40,6 +40,7 @@ AMI_ID=""
 PUBLIC_IP=""
 VOLUME_TOKEN=""
 INSTANCE_TOKEN=""
+INSTANCE_READY="0"
 LOCK_DIR=""
 
 info() { printf '==> %s\n' "$*" >&2; }
@@ -76,6 +77,7 @@ EXAMPLES
   ./aws-ec2-vm.sh setup
   ./aws-ec2-vm.sh create
   ./aws-ec2-vm.sh create mlbox --vcpus 4 --memory 16 --disk 200
+  ./aws-ec2-vm.sh status mlbox
   ./aws-ec2-vm.sh ssh mlbox
   ./aws-ec2-vm.sh stop mlbox
   ./aws-ec2-vm.sh start mlbox
@@ -180,7 +182,7 @@ save_state() {
   local tmp="$STATE_FILE.tmp.$$" key value
   umask 077
   : > "$tmp"
-  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID INSTANCE_TYPE DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN; do
+  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID INSTANCE_TYPE DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY; do
     eval "value=\${$key}"
     case "$value" in *$'\n'*|*$'\r'*) rm -f "$tmp"; die "state value contains a newline" ;; esac
     printf '%s=%s\n' "$key" "$value" >> "$tmp"
@@ -212,6 +214,7 @@ load_state() {
       PUBLIC_IP) PUBLIC_IP="$value" ;;
       VOLUME_TOKEN) VOLUME_TOKEN="$value" ;;
       INSTANCE_TOKEN) INSTANCE_TOKEN="$value" ;;
+      INSTANCE_READY) INSTANCE_READY="$value" ;;
       '') ;;
       *) die "unknown field in state file: $key" ;;
     esac
@@ -222,6 +225,7 @@ load_state() {
   case "$INSTANCE_ID" in ''|i-[a-zA-Z0-9]*) ;; *) die "invalid instance ID in state" ;; esac
   case "$VOLUME_ID" in ''|vol-[a-zA-Z0-9]*) ;; *) die "invalid volume ID in state" ;; esac
   case "$SG_ID" in ''|sg-[a-zA-Z0-9]*) ;; *) die "invalid security group ID in state" ;; esac
+  case "$INSTANCE_READY" in 0|1) ;; *) die "invalid readiness marker in state" ;; esac
   is_uint "$DISK_GIB" || die "invalid disk size in state"
 }
 
@@ -244,15 +248,23 @@ configure_aws_array() {
 
 install_aws_cli() {
   command -v curl >/dev/null 2>&1 || die "curl is required to install AWS CLI"
-  local os arch tmp
+  local os arch tmp signature
   os="$(uname -s)"
   arch="$(uname -m)"
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/awscli.XXXXXX")"
   if [ "$os" = "Darwin" ]; then
     info "Downloading the official AWS CLI v2 macOS package"
     curl -fL --proto '=https' --tlsv1.2 -o "$tmp/AWSCLIV2.pkg" "https://awscli.amazonaws.com/AWSCLIV2.pkg"
-    pkgutil --check-signature "$tmp/AWSCLIV2.pkg" | grep -q 'Developer ID Installer: Amazon Web Services' || {
+    signature="$(pkgutil --check-signature "$tmp/AWSCLIV2.pkg" 2>&1)" || {
       rm -rf "$tmp"; die "AWS CLI package signature verification failed";
+    }
+    case "$signature" in
+      *'Status: signed by a certificate trusted by macOS'*) ;;
+      *'Status: signed by a developer certificate issued by Apple for distribution'*'Notarization: trusted by the Apple notary service'*) ;;
+      *) rm -rf "$tmp"; die "AWS CLI package is not trusted by macOS" ;;
+    esac
+    printf '%s\n' "$signature" | grep -Eq 'Developer ID Installer: .* \(94KV3E626L\)' || {
+      rm -rf "$tmp"; die "AWS CLI package signer is not the expected AWS Team ID";
     }
     sudo installer -pkg "$tmp/AWSCLIV2.pkg" -target /
   elif [ "$os" = "Linux" ]; then
@@ -275,7 +287,7 @@ install_aws_cli() {
 }
 
 ensure_cli() {
-  command -v aws >/dev/null 2>&1 && return
+  command -v aws >/dev/null 2>&1 && return 0
   if [ "$NON_INTERACTIVE" -eq 1 ]; then
     die "AWS CLI is missing; run '$0 setup' first"
   fi
@@ -287,7 +299,7 @@ ensure_cli() {
 }
 
 resolve_region() {
-  [ -n "$REGION" ] && return
+  [ -n "$REGION" ] && return 0
   REGION="$(aws configure get region --profile "$PROFILE" 2>/dev/null || true)"
   REGION="${REGION:-$DEFAULT_REGION}"
 }
@@ -326,7 +338,7 @@ setup() {
 aws_text() { "${AWS[@]}" "$@" --output text; }
 
 discover_ssh_cidr() {
-  [ -n "$SSH_CIDR" ] && return
+  [ -n "$SSH_CIDR" ] && return 0
   command -v curl >/dev/null 2>&1 || die "set --ssh-cidr because curl is unavailable"
   local ip
   ip="$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)"
@@ -337,7 +349,7 @@ discover_ssh_cidr() {
 }
 
 resolve_existing_volume() {
-  [ -n "$VOLUME_ID" ] || return
+  [ -n "$VOLUME_ID" ] || return 0
   local result state attachment attached_state
   result="$(aws_text ec2 describe-volumes --volume-ids "$VOLUME_ID" --query 'Volumes[0].[AvailabilityZone,State,Attachments[0].InstanceId]')" || die "cannot inspect persistent volume $VOLUME_ID"
   AZ="$(printf '%s\n' "$result" | awk '{print $1}')"
@@ -474,7 +486,7 @@ ensure_volume() {
 }
 
 resolve_ami() {
-  [ -z "$AMI_ID" ] || return
+  [ -z "$AMI_ID" ] || return 0
   AMI_ID="$(aws_text ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value)"
   [ -n "$AMI_ID" ] && [ "$AMI_ID" != "None" ] || die "could not resolve Amazon Linux 2023 AMI"
 }
@@ -484,7 +496,7 @@ create_instance() {
   if [ -n "$INSTANCE_ID" ]; then
     prior_state="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name')" || die "cannot inspect recorded instance $INSTANCE_ID"
     case "$prior_state" in
-      terminated) INSTANCE_ID=""; INSTANCE_TOKEN=""; PUBLIC_IP=""; save_state ;;
+      terminated) INSTANCE_ID=""; INSTANCE_TOKEN=""; INSTANCE_READY="0"; PUBLIC_IP=""; save_state ;;
       pending|running) info "Resuming setup for $INSTANCE_ID ($prior_state)" ;;
       stopped) info "Starting partial instance $INSTANCE_ID to finish setup"; aws_text ec2 start-instances --instance-ids "$INSTANCE_ID" --query 'StartingInstances[0].CurrentState.Name' >/dev/null ;;
       shutting-down|stopping) die "instance $INSTANCE_ID is $prior_state; wait and retry" ;;
@@ -513,6 +525,8 @@ create_instance() {
   info "Waiting for EC2 health checks"
   "${AWS[@]}" ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
   refresh_public_ip
+  INSTANCE_READY="1"
+  save_state
 }
 
 refresh_public_ip() {
@@ -564,16 +578,31 @@ create_vm() {
   live_account="$(aws_text sts get-caller-identity --query Account)"
   [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "$live_account" ] || die "state belongs to AWS account $ACCOUNT_ID, but current credentials use $live_account"
   ACCOUNT_ID="$live_account"
+  if [ "$INSTANCE_READY" = "1" ] && [ -n "$INSTANCE_ID" ]; then
+    local existing_state
+    existing_state="$(instance_state)"
+    case "$existing_state" in
+      pending|running|stopping|stopped)
+        die "VM '$NAME' already exists as $INSTANCE_ID ($existing_state); use '$0 status $NAME' instead"
+        ;;
+      shutting-down) die "VM '$NAME' is shutting down; wait, then run create again to reuse its storage" ;;
+      terminated|not-found|None) INSTANCE_READY="0" ;;
+      *) die "cannot safely create: recorded instance $INSTANCE_ID is $existing_state" ;;
+    esac
+  fi
   discover_ssh_cidr
+  info "Resolving VPC, subnet, and Availability Zone"
   resolve_existing_volume
   resolve_subnet
   verify_public_route
+  info "Resolving AMI and instance type"
   resolve_instance_type
   verify_instance_offering
   resolve_ami
   save_state
   ensure_key
   ensure_security_group
+  info "Preparing persistent EBS storage"
   ensure_volume
   create_instance
   print_commands
@@ -657,7 +686,7 @@ ssh_vm() {
 }
 
 confirm() {
-  [ "$YES" -eq 1 ] && return
+  [ "$YES" -eq 1 ] && return 0
   [ "$NON_INTERACTIVE" -eq 0 ] || die "confirmation required; rerun with --yes"
   local answer
   printf '%s Type %s to continue: ' "$1" "$NAME" >&2
@@ -678,6 +707,7 @@ terminate_vm() {
   aws_text ec2 terminate-instances --instance-ids "$INSTANCE_ID" --query 'TerminatingInstances[0].CurrentState.Name' >/dev/null
   "${AWS[@]}" ec2 wait instance-terminated --instance-ids "$INSTANCE_ID"
   PUBLIC_IP=""
+  INSTANCE_READY="0"
   save_state
   info "Instance terminated. Persistent volume retained: $VOLUME_ID"
   printf 'Recreate in %s with: %q create %q\n' "$AZ" "$0" "$NAME"
