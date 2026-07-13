@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly VERSION="1.3.0"
+readonly VERSION="1.2.0"
 readonly DEFAULT_NAME="dev-vm"
 readonly DEFAULT_VCPUS="2"
 readonly DEFAULT_MEMORY_GIB="4"
@@ -58,8 +58,6 @@ MOUNT_DIR=""
 MOUNT_DIR_EXPLICIT=0
 INSTALL_DEPS=0
 FORCE=0
-SPOT=0
-SPOT_EXPLICIT=0
 RECOVER_STALE_MOUNT=0
 STORAGE_UUID=""
 STORAGE_RESULT=""
@@ -115,7 +113,6 @@ CREATE OPTIONS
   --vcpus N             Exact vCPU count (default: 2, or 4 with --model)
   --memory GIB          Exact RAM in GiB (default: 4, or 16 with --model)
   --instance-type TYPE  Use this EC2 type instead of resolving vCPU/RAM
-  --spot                Launch a persistent Spot Instance (default: on-demand)
   --disk GIB            Persistent encrypted gp3 data disk (default: 50)
   --subnet-id ID        Subnet to use; otherwise a default subnet is selected
   --ssh-cidr CIDR       IPv4 CIDR allowed to SSH; default: your public IP /32
@@ -148,7 +145,6 @@ EXAMPLES
   ./aws-ec2-vm.sh create                    # small 2 vCPU / 4 GiB development VM
   ./aws-ec2-vm.sh create llmbox --model gemma4 --instance-type g6.xlarge --disk 100
   ./aws-ec2-vm.sh create devbox --vcpus 4 --memory 8 --disk 200
-  ./aws-ec2-vm.sh create devbox --spot      # interruptible; supports stop/start
   ./aws-ec2-vm.sh status mlbox
   ./aws-ec2-vm.sh ssh mlbox
   ./aws-ec2-vm.sh ssh mlbox --forward-agent -- git status
@@ -174,8 +170,6 @@ STORAGE AND COST
   Stopped VMs and retained EBS volumes can still cost money. AWS also charges
   for public IPv4 while allocated. Public IPv4 may change after stop/start. The
   script never deletes persistent storage as part of termination or failure.
-  Spot Instances can be interrupted by AWS; --spot uses a persistent request
-  with stop behavior so the VM can be stopped and started normally.
 
   The data disk is never formatted automatically. On first use, run
   `init-storage`; it proves the EBS/NVMe identity and blank state, then requires
@@ -235,7 +229,6 @@ parse_args() {
       --memory) need_value "$@"; MEMORY_GIB="$2"; MEMORY_EXPLICIT=1; shift 2 ;;
       --disk) need_value "$@"; DISK_GIB="$2"; DISK_EXPLICIT=1; shift 2 ;;
       --instance-type) need_value "$@"; INSTANCE_TYPE="$2"; INSTANCE_TYPE_EXPLICIT=1; shift 2 ;;
-      --spot) SPOT=1; SPOT_EXPLICIT=1; shift ;;
       --subnet-id) need_value "$@"; SUBNET_ID="$2"; shift 2 ;;
       --ssh-cidr) need_value "$@"; SSH_CIDR="$2"; shift 2 ;;
       --model) need_value "$@"; MODEL="$2"; MODEL_EXPLICIT=1; shift 2 ;;
@@ -276,7 +269,6 @@ validate_args() {
   [ -z "$PORT_CIDR" ] || valid_cidr "$PORT_CIDR" || die "invalid IPv4 CIDR: $PORT_CIDR"
   [ "$COMMAND" = "expose-port" ] || [ "$COMMAND" = "create" ] || [ -z "$PORT_CIDR" ] || die "--cidr is supported only by create and expose-port"
   [ "$COMMAND" = "create" ] || [ "$MODEL_EXPLICIT" -eq 0 ] || die "--model is supported only by create"
-  [ "$COMMAND" = "create" ] || [ "$SPOT" -eq 0 ] || die "--spot is supported only by create"
   if [ "$MOUNT_DIR_EXPLICIT" -eq 1 ]; then
     [ -n "$MOUNT_DIR" ] || die "--mount-dir requires a non-empty path"
     case "$MOUNT_DIR" in *[[:cntrl:]]*) die "--mount-dir must not contain control characters" ;; esac
@@ -348,7 +340,7 @@ save_state() {
   local tmp="$STATE_FILE.tmp.$$" key value
   umask 077
   : > "$tmp"
-  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID INSTANCE_TYPE VCPUS MEMORY_GIB DISK_GIB SPOT PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_MODE OLLAMA_CIDR OLLAMA_READY; do
+  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID INSTANCE_TYPE VCPUS MEMORY_GIB DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_MODE OLLAMA_CIDR OLLAMA_READY; do
     eval "value=\${$key}"
     case "$value" in *$'\n'*|*$'\r'*) rm -f "$tmp"; die "state value contains a newline" ;; esac
     printf '%s=%s\n' "$key" "$value" >> "$tmp"
@@ -379,7 +371,7 @@ load_state() {
       VCPUS) VCPUS_SAVED=1; [ "$VCPUS_EXPLICIT" -eq 1 ] || VCPUS="$value" ;;
       MEMORY_GIB) MEMORY_SAVED=1; [ "$MEMORY_EXPLICIT" -eq 1 ] || MEMORY_GIB="$value" ;;
       DISK_GIB) [ "$DISK_EXPLICIT" -eq 1 ] || DISK_GIB="$value" ;;
-      SPOT) [ "$SPOT_EXPLICIT" -eq 1 ] || SPOT="$value" ;;
+      SPOT) case "$value" in 0|1) ;; *) die "invalid legacy Spot marker in state" ;; esac ;;
       PUBLIC_IP) PUBLIC_IP="$value" ;;
       VOLUME_TOKEN) VOLUME_TOKEN="$value" ;;
       INSTANCE_TOKEN) INSTANCE_TOKEN="$value" ;;
@@ -411,7 +403,6 @@ load_state() {
   is_uint "$MEMORY_GIB" || die "invalid memory size in state"
   case "$VCPUS:$MEMORY_GIB" in *:0*|0*) die "invalid numeric value with leading zeros in state" ;; esac
   is_uint "$DISK_GIB" || die "invalid disk size in state"
-  case "$SPOT" in 0|1) ;; *) die "invalid Spot marker in state" ;; esac
   [[ "$MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$ ]] || die "invalid Ollama model in state"
   [ -z "$OLLAMA_CIDR" ] || valid_cidr "$OLLAMA_CIDR" || die "invalid Ollama CIDR in state"
   case "$OLLAMA_READY" in 0|1) ;; *) die "invalid Ollama readiness marker in state" ;; esac
@@ -790,7 +781,6 @@ resolve_ami() {
 create_instance() {
   local prior_state="" attachment=""
   local -a root_mapping=()
-  local -a market_options=()
   if [ -n "$INSTANCE_ID" ]; then
     prior_state="$(instance_state)"
     case "$prior_state" in
@@ -808,10 +798,7 @@ create_instance() {
     else
       root_mapping=(--block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"DeleteOnTermination":true,"VolumeType":"gp3"}}]')
     fi
-    if [ "$SPOT" -eq 1 ]; then
-      market_options=(--instance-market-options 'MarketType=spot,SpotOptions={SpotInstanceType=persistent,InstanceInterruptionBehavior=stop}')
-    fi
-    INSTANCE_ID="$(aws_text ec2 run-instances --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --count 1 --subnet-id "$SUBNET_ID" --security-group-ids "$SG_ID" --key-name "$KEY_NAME" --associate-public-ip-address --metadata-options HttpEndpoint=enabled,HttpTokens=required --instance-initiated-shutdown-behavior stop --client-token "$INSTANCE_TOKEN" "${market_options[@]}" "${root_mapping[@]}" --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ManagedBy,Value=aws-ec2-vm}]" --query 'Instances[0].InstanceId')"
+    INSTANCE_ID="$(aws_text ec2 run-instances --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --count 1 --subnet-id "$SUBNET_ID" --security-group-ids "$SG_ID" --key-name "$KEY_NAME" --associate-public-ip-address --metadata-options HttpEndpoint=enabled,HttpTokens=required --instance-initiated-shutdown-behavior stop --client-token "$INSTANCE_TOKEN" "${root_mapping[@]}" --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ManagedBy,Value=aws-ec2-vm}]" --query 'Instances[0].InstanceId')"
     save_state
     info "Created instance $INSTANCE_ID"
   fi
@@ -2303,7 +2290,7 @@ confirm() {
 
 terminate_vm() {
   prepare_existing
-  local state spot_request
+  local state
   state="$(instance_state)"
   case "$state" in terminated|not-found|None) info "instance is already $state"; return ;; esac
   local persistent
@@ -2311,15 +2298,7 @@ terminate_vm() {
   persistent="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].BlockDeviceMappings[?Ebs.VolumeId=='$VOLUME_ID'].Ebs.DeleteOnTermination | [0]")"
   [ "$persistent" = "False" ] || [ "$persistent" = "false" ] || die "persistent volume protection could not be verified; refusing termination"
   confirm "Terminate instance $INSTANCE_ID? Persistent volume $VOLUME_ID will be kept."
-  spot_request="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].SpotInstanceRequestId')"
-  if [ -n "$spot_request" ] && [ "$spot_request" != "None" ]; then
-    aws_text ec2 cancel-spot-instance-requests --spot-instance-request-ids "$spot_request" --query 'CancelledSpotInstanceRequests[0].State' >/dev/null
-  fi
-  state="$(instance_state)"
-  case "$state" in
-    terminated|shutting-down|not-found|None) ;;
-    *) aws_text ec2 terminate-instances --instance-ids "$INSTANCE_ID" --query 'TerminatingInstances[0].CurrentState.Name' >/dev/null ;;
-  esac
+  aws_text ec2 terminate-instances --instance-ids "$INSTANCE_ID" --query 'TerminatingInstances[0].CurrentState.Name' >/dev/null
   "${AWS[@]}" ec2 wait instance-terminated --instance-ids "$INSTANCE_ID"
   PUBLIC_IP=""
   PUBLIC_DNS=""

@@ -324,8 +324,16 @@ on run argv
 
   if appChoice is "iterm2" then
     tell application "iTerm"
-      set newWindow to create window with default profile
-      tell current session of newWindow
+      try
+        tell current window
+          set newTab to create tab with default profile
+        end tell
+        set newSession to current session of newTab
+      on error
+        set newWindow to create window with default profile
+        set newSession to current session of newWindow
+      end try
+      tell newSession
         set name to windowTitle
         write text commandText
       end tell
@@ -333,7 +341,11 @@ on run argv
     end tell
   else if appChoice is "terminal" then
     tell application "Terminal"
-      set newTab to do script commandText
+      try
+        set newTab to do script commandText in front window
+      on error
+        set newTab to do script commandText
+      end try
       set custom title of newTab to windowTitle
       activate
     end tell
