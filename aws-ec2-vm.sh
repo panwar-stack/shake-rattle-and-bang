@@ -3,8 +3,10 @@ set -Eeuo pipefail
 
 readonly VERSION="1.2.0"
 readonly DEFAULT_NAME="dev-vm"
-readonly DEFAULT_VCPUS="4"
-readonly DEFAULT_MEMORY_GIB="16"
+readonly DEFAULT_VCPUS="2"
+readonly DEFAULT_MEMORY_GIB="4"
+readonly DEFAULT_MODEL_VCPUS="4"
+readonly DEFAULT_MODEL_MEMORY_GIB="16"
 readonly DEFAULT_DISK_GIB="50"
 readonly DEFAULT_ROOT_DISK_GIB="30"
 readonly DEFAULT_MODEL="gemma3:4b"
@@ -21,7 +23,13 @@ REGION_EXPLICIT=0
 VCPUS="$DEFAULT_VCPUS"
 MEMORY_GIB="$DEFAULT_MEMORY_GIB"
 DISK_GIB="$DEFAULT_DISK_GIB"
+VCPUS_EXPLICIT=0
+MEMORY_EXPLICIT=0
+DISK_EXPLICIT=0
+VCPUS_SAVED=0
+MEMORY_SAVED=0
 INSTANCE_TYPE=""
+INSTANCE_TYPE_EXPLICIT=0
 SUBNET_ID=""
 SSH_CIDR=""
 PORT=""
@@ -31,6 +39,7 @@ MODEL="$DEFAULT_MODEL"
 MODEL_EXPLICIT=0
 OLLAMA_CIDR=""
 OLLAMA_READY="0"
+OLLAMA_MODE=""
 YES=0
 NON_INTERACTIVE=0
 STATE_DIR="${AWS_VM_STATE_DIR:-$HOME/.aws-ec2-vm}"
@@ -38,6 +47,9 @@ STATE_FILE=""
 AWS=()
 SSH_FORWARD_AGENT=0
 SSH_TTY=0
+SSH_QUIET=0
+SSH_CONTROL_PATH="${AWS_VM_SSH_CONTROL_PATH:-}"
+SSH_CONTROL_COMMAND="${AWS_VM_SSH_CONTROL_COMMAND:-}"
 SSH_REMOTE_COMMAND=()
 SSH_KNOWN_HOSTS=""
 SSH_ARGS=()
@@ -82,7 +94,7 @@ shell_quote() { printf '%q' "$1"; }
 
 usage() {
   cat <<'EOF'
-aws-ec2-vm.sh - create and manage an Ollama EC2 VM
+aws-ec2-vm.sh - create a small EC2 development VM with optional Ollama
 
 USAGE
   aws-ec2-vm.sh setup [--profile PROFILE] [--region REGION]
@@ -96,14 +108,14 @@ USAGE
   aws-ec2-vm.sh destroy-storage [NAME] [--yes] [OPTIONS]
 
 CREATE OPTIONS
-  --vcpus N             Exact vCPU count (default: 4)
-  --memory GIB          Exact RAM in GiB (default: 16)
+  --vcpus N             Exact vCPU count (default: 2, or 4 with --model)
+  --memory GIB          Exact RAM in GiB (default: 4, or 16 with --model)
   --instance-type TYPE  Use this EC2 type instead of resolving vCPU/RAM
   --disk GIB            Persistent encrypted gp3 data disk (default: 50)
   --subnet-id ID        Subnet to use; otherwise a default subnet is selected
   --ssh-cidr CIDR       IPv4 CIDR allowed to SSH; default: your public IP /32
-  --model MODEL         Ollama model to pull and test (default: gemma3:4b)
-  --cidr CIDR           IPv4 CIDR allowed to reach Ollama; default: your public IP /32
+  --model MODEL         Opt into Ollama and pull/test MODEL (recommended: gemma3:4b)
+  --cidr CIDR           IPv4 CIDR allowed to reach Ollama; requires Ollama mode
 
 COMMON OPTIONS
   --profile PROFILE     AWS CLI profile (default: AWS_PROFILE or default)
@@ -120,16 +132,17 @@ STORAGE OPTIONS
 SSH OPTIONS
   --forward-agent       Forward the local SSH agent for this connection
   --tty                 Force pseudo-terminal allocation
+  --quiet               Suppress non-error OpenSSH client diagnostics
   -- COMMAND [ARG...]   Run a remote command with arguments preserved safely
 
 PORT OPTIONS
-  --cidr CIDR           IPv4 CIDR allowed by create or expose-port; default: your public IP /32
+  --cidr CIDR           IPv4 CIDR for model create or expose-port; default: your public IP /32
 
 EXAMPLES
   ./aws-ec2-vm.sh setup
-  ./aws-ec2-vm.sh create
-  ./aws-ec2-vm.sh create mlbox --model gemma3:4b
-  ./aws-ec2-vm.sh create mlbox --vcpus 4 --memory 16 --disk 200
+  ./aws-ec2-vm.sh create                    # small 2 vCPU / 4 GiB development VM
+  ./aws-ec2-vm.sh create llmbox --model gemma4 --instance-type g6f.4xlarge --disk 100
+  ./aws-ec2-vm.sh create devbox --vcpus 4 --memory 8 --disk 200
   ./aws-ec2-vm.sh status mlbox
   ./aws-ec2-vm.sh ssh mlbox
   ./aws-ec2-vm.sh ssh mlbox --forward-agent -- git status
@@ -148,9 +161,9 @@ EXAMPLES
   ./aws-ec2-vm.sh destroy-storage mlbox # permanently deletes that volume
 
 STORAGE AND COST
-  The 30 GiB encrypted gp3 root disk is disposable. A separate encrypted EBS
-  volume is attached with DeleteOnTermination=false, so it survives reboot,
-  stop, and termination.
+  The AMI-sized root disk is disposable (Ollama mode uses at least 30 GiB). A
+  separate encrypted EBS volume is attached with DeleteOnTermination=false, so
+  it survives reboot, stop, and termination.
   EBS is tied to one Availability Zone; replacement VMs are created there.
   Stopped VMs and retained EBS volumes can still cost money. AWS also charges
   for public IPv4 while allocated. Public IPv4 may change after stop/start. The
@@ -210,16 +223,17 @@ parse_args() {
         ;;
       --profile) need_value "$@"; PROFILE="$2"; PROFILE_EXPLICIT=1; shift 2 ;;
       --region) need_value "$@"; REGION="$2"; REGION_EXPLICIT=1; shift 2 ;;
-      --vcpus) need_value "$@"; VCPUS="$2"; shift 2 ;;
-      --memory) need_value "$@"; MEMORY_GIB="$2"; shift 2 ;;
-      --disk) need_value "$@"; DISK_GIB="$2"; shift 2 ;;
-      --instance-type) need_value "$@"; INSTANCE_TYPE="$2"; shift 2 ;;
+      --vcpus) need_value "$@"; VCPUS="$2"; VCPUS_EXPLICIT=1; shift 2 ;;
+      --memory) need_value "$@"; MEMORY_GIB="$2"; MEMORY_EXPLICIT=1; shift 2 ;;
+      --disk) need_value "$@"; DISK_GIB="$2"; DISK_EXPLICIT=1; shift 2 ;;
+      --instance-type) need_value "$@"; INSTANCE_TYPE="$2"; INSTANCE_TYPE_EXPLICIT=1; shift 2 ;;
       --subnet-id) need_value "$@"; SUBNET_ID="$2"; shift 2 ;;
       --ssh-cidr) need_value "$@"; SSH_CIDR="$2"; shift 2 ;;
       --model) need_value "$@"; MODEL="$2"; MODEL_EXPLICIT=1; shift 2 ;;
       --cidr) need_value "$@"; PORT_CIDR="$2"; PORT_CIDR_EXPLICIT=1; shift 2 ;;
       --forward-agent) SSH_FORWARD_AGENT=1; shift ;;
       --tty) SSH_TTY=1; shift ;;
+      --quiet) SSH_QUIET=1; shift ;;
       --mount-dir) need_value "$@"; MOUNT_DIR="$2"; MOUNT_DIR_EXPLICIT=1; shift 2 ;;
       --install-deps) INSTALL_DEPS=1; shift ;;
       --force) FORCE=1; shift ;;
@@ -269,9 +283,18 @@ validate_args() {
     [ "$YES" -eq 0 ] || die "init-storage does not accept --yes; exact TTY confirmation is required"
     [ "$NON_INTERACTIVE" -eq 0 ] || die "init-storage does not accept --non-interactive; exact TTY confirmation is required"
   fi
-  if [ "$COMMAND" != "ssh" ] && { [ "$SSH_FORWARD_AGENT" -eq 1 ] || [ "$SSH_TTY" -eq 1 ] || [ "${#SSH_REMOTE_COMMAND[@]}" -gt 0 ]; }; then
+  if [ "$COMMAND" != "ssh" ] && { [ "$SSH_FORWARD_AGENT" -eq 1 ] || [ "$SSH_TTY" -eq 1 ] || [ "$SSH_QUIET" -eq 1 ] || [ "${#SSH_REMOTE_COMMAND[@]}" -gt 0 ]; }; then
     die "SSH options are supported only by ssh"
   fi
+  if [ -n "$SSH_CONTROL_PATH" ]; then
+    case "$SSH_CONTROL_PATH" in /*) ;; *) die "AWS_VM_SSH_CONTROL_PATH must be absolute" ;; esac
+    case "$SSH_CONTROL_PATH" in *[[:cntrl:]]*) die "AWS_VM_SSH_CONTROL_PATH must not contain control characters" ;; esac
+    case "$SSH_CONTROL_PATH" in *%*) die "AWS_VM_SSH_CONTROL_PATH must not contain percent expansions" ;; esac
+    [ "$(LC_ALL=C printf %s "$SSH_CONTROL_PATH" | wc -c | tr -d ' ')" -le 90 ] || die "AWS_VM_SSH_CONTROL_PATH is too long"
+  fi
+  case "$SSH_CONTROL_COMMAND" in ''|check|exit) ;; *) die "invalid AWS_VM_SSH_CONTROL_COMMAND" ;; esac
+  [ -z "$SSH_CONTROL_COMMAND" ] || { [ "$COMMAND" = "ssh" ] && [ -n "$SSH_CONTROL_PATH" ] && [ "${#SSH_REMOTE_COMMAND[@]}" -eq 0 ]; } ||
+    die "AWS_VM_SSH_CONTROL_COMMAND requires ssh and AWS_VM_SSH_CONTROL_PATH"
 }
 
 valid_cidr() {
@@ -309,7 +332,7 @@ save_state() {
   local tmp="$STATE_FILE.tmp.$$" key value
   umask 077
   : > "$tmp"
-  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID INSTANCE_TYPE DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_CIDR OLLAMA_READY; do
+  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID INSTANCE_TYPE VCPUS MEMORY_GIB DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_MODE OLLAMA_CIDR OLLAMA_READY; do
     eval "value=\${$key}"
     case "$value" in *$'\n'*|*$'\r'*) rm -f "$tmp"; die "state value contains a newline" ;; esac
     printf '%s=%s\n' "$key" "$value" >> "$tmp"
@@ -321,7 +344,7 @@ save_state() {
 load_state() {
   [ -f "$STATE_FILE" ] || die "no state for '$NAME'; run create first ($STATE_FILE)"
   [ ! -L "$STATE_FILE" ] || die "refusing symlinked state file: $STATE_FILE"
-  local key value saved_profile="" saved_region=""
+  local key value saved_profile="" saved_region="" ollama_mode_present=0
   while IFS='=' read -r key value; do
     case "$key" in
       PROFILE) saved_profile="$value" ;;
@@ -336,13 +359,16 @@ load_state() {
       KEY_NAME) KEY_NAME="$value" ;;
       KEY_PATH) KEY_PATH="$value" ;;
       AMI_ID) AMI_ID="$value" ;;
-      INSTANCE_TYPE) INSTANCE_TYPE="$value" ;;
-      DISK_GIB) DISK_GIB="$value" ;;
+      INSTANCE_TYPE) [ "$INSTANCE_TYPE_EXPLICIT" -eq 1 ] || INSTANCE_TYPE="$value" ;;
+      VCPUS) VCPUS_SAVED=1; [ "$VCPUS_EXPLICIT" -eq 1 ] || VCPUS="$value" ;;
+      MEMORY_GIB) MEMORY_SAVED=1; [ "$MEMORY_EXPLICIT" -eq 1 ] || MEMORY_GIB="$value" ;;
+      DISK_GIB) [ "$DISK_EXPLICIT" -eq 1 ] || DISK_GIB="$value" ;;
       PUBLIC_IP) PUBLIC_IP="$value" ;;
       VOLUME_TOKEN) VOLUME_TOKEN="$value" ;;
       INSTANCE_TOKEN) INSTANCE_TOKEN="$value" ;;
       INSTANCE_READY) INSTANCE_READY="$value" ;;
       MODEL) [ "$MODEL_EXPLICIT" -eq 1 ] || MODEL="$value" ;;
+      OLLAMA_MODE) OLLAMA_MODE="$value"; ollama_mode_present=1 ;;
       OLLAMA_CIDR) OLLAMA_CIDR="$value" ;;
       OLLAMA_READY) OLLAMA_READY="$value" ;;
       '') ;;
@@ -352,15 +378,26 @@ load_state() {
   [ "$PROFILE_EXPLICIT" -eq 0 ] || [ "$PROFILE" = "$saved_profile" ] || die "state uses profile '$saved_profile', not requested '$PROFILE'"
   [ "$REGION_EXPLICIT" -eq 0 ] || [ "$REGION" = "$saved_region" ] || die "state uses region '$saved_region', not requested '$REGION'"
   PROFILE="$saved_profile"; REGION="$saved_region"
+  if [ "$ollama_mode_present" -eq 0 ]; then
+    if [ -n "$OLLAMA_CIDR" ] || [ "$OLLAMA_READY" = "1" ]; then OLLAMA_MODE="1"; else OLLAMA_MODE="0"; fi
+  fi
+  if [ "$OLLAMA_MODE" = "1" ]; then
+    [ "$VCPUS_EXPLICIT" -eq 1 ] || [ "$VCPUS_SAVED" -eq 1 ] || VCPUS="$DEFAULT_MODEL_VCPUS"
+    [ "$MEMORY_EXPLICIT" -eq 1 ] || [ "$MEMORY_SAVED" -eq 1 ] || MEMORY_GIB="$DEFAULT_MODEL_MEMORY_GIB"
+  fi
   case "$INSTANCE_ID" in ''|i-*) ;; *) die "invalid instance ID in state" ;; esac
   case "${INSTANCE_ID#i-}" in ''|*[!a-zA-Z0-9]*) [ -z "$INSTANCE_ID" ] || die "invalid instance ID in state" ;; esac
   case "$VOLUME_ID" in ''|vol-[a-zA-Z0-9]*) ;; *) die "invalid volume ID in state" ;; esac
   case "$SG_ID" in ''|sg-[a-zA-Z0-9]*) ;; *) die "invalid security group ID in state" ;; esac
   case "$INSTANCE_READY" in 0|1) ;; *) die "invalid readiness marker in state" ;; esac
+  is_uint "$VCPUS" || die "invalid vCPU count in state"
+  is_uint "$MEMORY_GIB" || die "invalid memory size in state"
+  case "$VCPUS:$MEMORY_GIB" in *:0*|0*) die "invalid numeric value with leading zeros in state" ;; esac
   is_uint "$DISK_GIB" || die "invalid disk size in state"
   [[ "$MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$ ]] || die "invalid Ollama model in state"
   [ -z "$OLLAMA_CIDR" ] || valid_cidr "$OLLAMA_CIDR" || die "invalid Ollama CIDR in state"
   case "$OLLAMA_READY" in 0|1) ;; *) die "invalid Ollama readiness marker in state" ;; esac
+  case "$OLLAMA_MODE" in 0|1) ;; *) die "invalid Ollama mode marker in state" ;; esac
 }
 
 release_mount_path_lock() {
@@ -722,16 +759,19 @@ resolve_ami() {
     AMI_ID="$(aws_text ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value)"
   fi
   [ -n "$AMI_ID" ] && [ "$AMI_ID" != "None" ] || die "could not resolve Amazon Linux 2023 AMI"
-  ROOT_DEVICE_NAME="$(aws_text ec2 describe-images --image-ids "$AMI_ID" --query 'Images[0].RootDeviceName')"
-  [[ "$ROOT_DEVICE_NAME" =~ ^/dev/[a-zA-Z0-9._-]+$ ]] || die "AMI $AMI_ID has an invalid root device"
-  local ami_root_disk_gib
-  ami_root_disk_gib="$(aws_text ec2 describe-images --image-ids "$AMI_ID" --query "Images[0].BlockDeviceMappings[?DeviceName=='$ROOT_DEVICE_NAME'].Ebs.VolumeSize | [0]")"
-  is_uint "$ami_root_disk_gib" || die "AMI $AMI_ID has an invalid root volume size"
-  if [ "$ami_root_disk_gib" -gt "$ROOT_DISK_GIB" ]; then ROOT_DISK_GIB="$ami_root_disk_gib"; fi
+  if [ "$OLLAMA_MODE" = "1" ]; then
+    ROOT_DEVICE_NAME="$(aws_text ec2 describe-images --image-ids "$AMI_ID" --query 'Images[0].RootDeviceName')"
+    [[ "$ROOT_DEVICE_NAME" =~ ^/dev/[a-zA-Z0-9._-]+$ ]] || die "AMI $AMI_ID has an invalid root device"
+    local ami_root_disk_gib
+    ami_root_disk_gib="$(aws_text ec2 describe-images --image-ids "$AMI_ID" --query "Images[0].BlockDeviceMappings[?DeviceName=='$ROOT_DEVICE_NAME'].Ebs.VolumeSize | [0]")"
+    is_uint "$ami_root_disk_gib" || die "AMI $AMI_ID has an invalid root volume size"
+    if [ "$ami_root_disk_gib" -gt "$ROOT_DISK_GIB" ]; then ROOT_DISK_GIB="$ami_root_disk_gib"; fi
+  fi
 }
 
 create_instance() {
   local prior_state="" attachment=""
+  local -a root_mapping=()
   if [ -n "$INSTANCE_ID" ]; then
     prior_state="$(instance_state)"
     case "$prior_state" in
@@ -744,7 +784,12 @@ create_instance() {
   fi
   if [ -z "$INSTANCE_ID" ]; then
     if [ -z "$INSTANCE_TOKEN" ]; then INSTANCE_TOKEN="i-$ACCOUNT_ID-$(date +%s)-$$"; save_state; fi
-    INSTANCE_ID="$(aws_text ec2 run-instances --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --count 1 --subnet-id "$SUBNET_ID" --security-group-ids "$SG_ID" --key-name "$KEY_NAME" --associate-public-ip-address --metadata-options HttpEndpoint=enabled,HttpTokens=required --instance-initiated-shutdown-behavior stop --client-token "$INSTANCE_TOKEN" --block-device-mappings "[{\"DeviceName\":\"$ROOT_DEVICE_NAME\",\"Ebs\":{\"DeleteOnTermination\":true,\"Encrypted\":true,\"VolumeType\":\"gp3\",\"VolumeSize\":$ROOT_DISK_GIB}}]" --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ManagedBy,Value=aws-ec2-vm}]" --query 'Instances[0].InstanceId')"
+    if [ "$OLLAMA_MODE" = "1" ]; then
+      root_mapping=(--block-device-mappings "[{\"DeviceName\":\"$ROOT_DEVICE_NAME\",\"Ebs\":{\"DeleteOnTermination\":true,\"Encrypted\":true,\"VolumeType\":\"gp3\",\"VolumeSize\":$ROOT_DISK_GIB}}]")
+    else
+      root_mapping=(--block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"DeleteOnTermination":true,"VolumeType":"gp3"}}]')
+    fi
+    INSTANCE_ID="$(aws_text ec2 run-instances --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --count 1 --subnet-id "$SUBNET_ID" --security-group-ids "$SG_ID" --key-name "$KEY_NAME" --associate-public-ip-address --metadata-options HttpEndpoint=enabled,HttpTokens=required --instance-initiated-shutdown-behavior stop --client-token "$INSTANCE_TOKEN" "${root_mapping[@]}" --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ManagedBy,Value=aws-ec2-vm}]" --query 'Instances[0].InstanceId')"
     save_state
     info "Created instance $INSTANCE_ID"
   fi
@@ -925,6 +970,12 @@ ensure_ollama() {
 create_vm() {
   mkdir -p "$STATE_DIR"
   if [ -f "$STATE_FILE" ]; then load_state; fi
+  [ -n "$OLLAMA_MODE" ] || OLLAMA_MODE="$MODEL_EXPLICIT"
+  if [ "$OLLAMA_MODE" = "1" ]; then
+    [ "$VCPUS_EXPLICIT" -eq 1 ] || [ "$VCPUS_SAVED" -eq 1 ] || VCPUS="$DEFAULT_MODEL_VCPUS"
+    [ "$MEMORY_EXPLICIT" -eq 1 ] || [ "$MEMORY_SAVED" -eq 1 ] || MEMORY_GIB="$DEFAULT_MODEL_MEMORY_GIB"
+  fi
+  [ "$PORT_CIDR_EXPLICIT" -eq 0 ] || [ "$OLLAMA_MODE" = "1" ] || [ "$MODEL_EXPLICIT" -eq 1 ] || die "create --cidr requires --model or a VM already in Ollama mode"
   ensure_auth
   local live_account
   live_account="$(aws_text sts get-caller-identity --query Account)"
@@ -934,8 +985,16 @@ create_vm() {
     local existing_state
     existing_state="$(instance_state)"
     case "$existing_state" in
+      terminated|not-found|None|'') ;;
+      *)
+        if [ "$OLLAMA_MODE" = "0" ] && [ "$MODEL_EXPLICIT" -eq 1 ]; then
+          die "VM '$NAME' is a completed plain VM; terminate it, then recreate with '$0 create $NAME --model $MODEL' to retain its data volume"
+        fi
+        ;;
+    esac
+    case "$existing_state" in
       running)
-        if [ "$OLLAMA_READY" = "0" ]; then
+        if [ "$OLLAMA_MODE" = "1" ] && [ "$OLLAMA_READY" = "0" ]; then
           info "Resuming Ollama setup for $INSTANCE_ID"
           ensure_ollama
           print_commands
@@ -951,7 +1010,19 @@ create_vm() {
       *) die "cannot safely create: recorded instance $INSTANCE_ID is $existing_state" ;;
     esac
   fi
-  configure_ollama_cidr
+  if [ "$MODEL_EXPLICIT" -eq 1 ] && [ "$OLLAMA_MODE" = "0" ]; then
+    if [ -n "$INSTANCE_ID" ]; then
+      local upgrade_state
+      upgrade_state="$(instance_state)"
+      case "$upgrade_state" in terminated|not-found|None|'') ;; *) die "VM '$NAME' has a partial plain instance $INSTANCE_ID ($upgrade_state); terminate it before recreating with Ollama" ;; esac
+    fi
+    OLLAMA_MODE="1"
+    [ "$VCPUS_EXPLICIT" -eq 1 ] || VCPUS="$DEFAULT_MODEL_VCPUS"
+    [ "$MEMORY_EXPLICIT" -eq 1 ] || MEMORY_GIB="$DEFAULT_MODEL_MEMORY_GIB"
+    [ "$INSTANCE_TYPE_EXPLICIT" -eq 1 ] || INSTANCE_TYPE=""
+  fi
+  save_state
+  if [ "$OLLAMA_MODE" = "1" ]; then configure_ollama_cidr; fi
   discover_ssh_cidr
   info "Resolving VPC, subnet, and Availability Zone"
   resolve_existing_volume
@@ -967,7 +1038,7 @@ create_vm() {
   info "Preparing persistent EBS storage"
   ensure_volume
   create_instance
-  ensure_ollama
+  if [ "$OLLAMA_MODE" = "1" ]; then ensure_ollama; fi
   INSTANCE_READY="1"
   save_state
   print_commands
@@ -1112,7 +1183,7 @@ start_vm() {
     *) die "instance is $state; wait and retry" ;;
   esac
   refresh_public_ip
-  ensure_ollama
+  if [ "$OLLAMA_MODE" = "1" ]; then ensure_ollama; fi
   print_commands
 }
 
@@ -1270,6 +1341,8 @@ build_ssh_args() {
     -o ServerAliveCountMax=3
     -i "$KEY_PATH"
   )
+  [ "$SSH_QUIET" -eq 0 ] || SSH_ARGS+=(-o LogLevel=ERROR)
+  [ -z "$SSH_CONTROL_PATH" ] || SSH_ARGS+=(-o ControlMaster=auto -o ControlPersist=600 -o "ControlPath=$SSH_CONTROL_PATH")
 }
 
 ssh_vm() {
@@ -1278,6 +1351,9 @@ ssh_vm() {
   release_lock
   trap - EXIT INT TERM HUP
   local remote_command="" quoted arg
+  if [ -n "$SSH_CONTROL_COMMAND" ]; then
+    exec ssh "${SSH_ARGS[@]}" -O "$SSH_CONTROL_COMMAND" "ec2-user@$PUBLIC_IP"
+  fi
   [ "$SSH_TTY" -eq 0 ] || SSH_ARGS+=(-tt)
   if [ "${#SSH_REMOTE_COMMAND[@]}" -gt 0 ]; then
     for arg in "${SSH_REMOTE_COMMAND[@]}"; do
