@@ -26,6 +26,7 @@ LOCAL_SHELL_CONTROL_PATH=""
 LOCAL_SHELL_CONTROL_LOG=""
 LOCAL_SHELL_CLEANUP=()
 LOCAL_SHELL_CHECK=()
+LOCAL_SHELL_SETUP_BASE=()
 LOCAL_SHELL_REMOTE_BASE=()
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
@@ -48,7 +49,7 @@ ensure_local_shell_master() {
   fi
   rm -f -- "$LOCAL_SHELL_CONTROL_PATH"
   : > "$LOCAL_SHELL_CONTROL_LOG"
-  if "${LOCAL_SHELL_REMOTE_BASE[@]}" -- /bin/true >/dev/null 2>"$LOCAL_SHELL_CONTROL_LOG"; then
+  if "${LOCAL_SHELL_SETUP_BASE[@]}" -- /bin/true >/dev/null 2>"$LOCAL_SHELL_CONTROL_LOG"; then
     return 0
   fi
   /bin/cat -- "$LOCAL_SHELL_CONTROL_LOG" >&2
@@ -372,7 +373,11 @@ local_shell() {
   chmod 700 "$LOCAL_SHELL_CONTROL_DIR"
   LOCAL_SHELL_CONTROL_PATH="$LOCAL_SHELL_CONTROL_DIR/m"
   LOCAL_SHELL_CONTROL_LOG="$LOCAL_SHELL_CONTROL_DIR/master.stderr"
-  LOCAL_SHELL_REMOTE_BASE=(/usr/bin/env "AWS_VM_STATE_DIR=$state_dir" "AWS_VM_SSH_CONTROL_PATH=$LOCAL_SHELL_CONTROL_PATH" /bin/bash "$vm_script" ssh "$NAME" --quiet)
+  LOCAL_SHELL_SETUP_BASE=(/usr/bin/env "AWS_VM_STATE_DIR=$state_dir" "AWS_VM_SSH_CONTROL_PATH=$LOCAL_SHELL_CONTROL_PATH" /bin/bash "$vm_script" ssh "$NAME" --quiet)
+  [ "$PROFILE_SET" -eq 0 ] || LOCAL_SHELL_SETUP_BASE+=(--profile "$PROFILE")
+  [ "$REGION_SET" -eq 0 ] || LOCAL_SHELL_SETUP_BASE+=(--region "$REGION")
+  [ "$FORWARD_AGENT" -eq 0 ] || LOCAL_SHELL_SETUP_BASE+=(--forward-agent)
+  LOCAL_SHELL_REMOTE_BASE=(/usr/bin/env "AWS_VM_STATE_DIR=$state_dir" "AWS_VM_SSH_CONTROL_PATH=$LOCAL_SHELL_CONTROL_PATH" "AWS_VM_SSH_CONTROL_COMMAND=attach" /bin/bash "$vm_script" ssh "$NAME" --quiet)
   [ "$PROFILE_SET" -eq 0 ] || LOCAL_SHELL_REMOTE_BASE+=(--profile "$PROFILE")
   [ "$REGION_SET" -eq 0 ] || LOCAL_SHELL_REMOTE_BASE+=(--region "$REGION")
   [ "$FORWARD_AGENT" -eq 0 ] || LOCAL_SHELL_REMOTE_BASE+=(--forward-agent)

@@ -143,7 +143,7 @@ PORT OPTIONS
 EXAMPLES
   ./aws-ec2-vm.sh setup
   ./aws-ec2-vm.sh create                    # small 2 vCPU / 4 GiB development VM
-  ./aws-ec2-vm.sh create llmbox --model gemma4 --instance-type g6f.4xlarge --disk 100
+  ./aws-ec2-vm.sh create llmbox --model gemma4 --instance-type g6.xlarge --disk 100
   ./aws-ec2-vm.sh create devbox --vcpus 4 --memory 8 --disk 200
   ./aws-ec2-vm.sh status mlbox
   ./aws-ec2-vm.sh ssh mlbox
@@ -297,9 +297,12 @@ validate_args() {
     case "$SSH_CONTROL_PATH" in *%*) die "AWS_VM_SSH_CONTROL_PATH must not contain percent expansions" ;; esac
     [ "$(LC_ALL=C printf %s "$SSH_CONTROL_PATH" | wc -c | tr -d ' ')" -le 90 ] || die "AWS_VM_SSH_CONTROL_PATH is too long"
   fi
-  case "$SSH_CONTROL_COMMAND" in ''|check|exit) ;; *) die "invalid AWS_VM_SSH_CONTROL_COMMAND" ;; esac
-  [ -z "$SSH_CONTROL_COMMAND" ] || { [ "$COMMAND" = "ssh" ] && [ -n "$SSH_CONTROL_PATH" ] && [ "${#SSH_REMOTE_COMMAND[@]}" -eq 0 ]; } ||
+  case "$SSH_CONTROL_COMMAND" in ''|check|exit|attach) ;; *) die "invalid AWS_VM_SSH_CONTROL_COMMAND" ;; esac
+  [ -z "$SSH_CONTROL_COMMAND" ] || { [ "$COMMAND" = "ssh" ] && [ -n "$SSH_CONTROL_PATH" ]; } ||
     die "AWS_VM_SSH_CONTROL_COMMAND requires ssh and AWS_VM_SSH_CONTROL_PATH"
+  case "$SSH_CONTROL_COMMAND" in
+    check|exit) [ "${#SSH_REMOTE_COMMAND[@]}" -eq 0 ] || die "AWS_VM_SSH_CONTROL_COMMAND=$SSH_CONTROL_COMMAND does not accept a remote command" ;;
+  esac
 }
 
 valid_cidr() {
@@ -1350,6 +1353,36 @@ build_ssh_args() {
   [ -z "$SSH_CONTROL_PATH" ] || SSH_ARGS+=(-o ControlMaster=auto -o ControlPersist=600 -o "ControlPath=$SSH_CONTROL_PATH")
 }
 
+fast_ssh_control() {
+  local forward_agent=no remote_command="" quoted arg
+  local -a args=(
+    -F /dev/null
+    -S "$SSH_CONTROL_PATH"
+    -o ControlMaster=no
+    -o "ProxyCommand=/usr/bin/false"
+    -o StrictHostKeyChecking=yes
+    -o UserKnownHostsFile=/dev/null
+    -o GlobalKnownHostsFile=/dev/null
+    -o KnownHostsCommand=none
+    -o BatchMode=yes
+  )
+  [ "$SSH_QUIET" -eq 0 ] || args+=(-o LogLevel=ERROR)
+  if [ "$SSH_CONTROL_COMMAND" != "attach" ]; then
+    exec ssh "${args[@]}" -O "$SSH_CONTROL_COMMAND" ec2-user@aws-vm-control-master.invalid
+  fi
+  [ "$SSH_FORWARD_AGENT" -eq 0 ] || forward_agent=yes
+  args+=(-o "ForwardAgent=$forward_agent")
+  [ "$SSH_TTY" -eq 0 ] || args+=(-tt)
+  if [ "${#SSH_REMOTE_COMMAND[@]}" -gt 0 ]; then
+    for arg in "${SSH_REMOTE_COMMAND[@]}"; do
+      printf -v quoted '%q' "$arg"
+      remote_command+="${remote_command:+ }$quoted"
+    done
+    exec ssh "${args[@]}" ec2-user@aws-vm-control-master.invalid "$remote_command"
+  fi
+  exec ssh "${args[@]}" ec2-user@aws-vm-control-master.invalid
+}
+
 ssh_vm() {
   prepare_ssh_endpoint
   build_ssh_args
@@ -2299,6 +2332,7 @@ main() {
   [ "$COMMAND" = "help" ] && { usage; exit 0; }
   [ "$COMMAND" = "version" ] && { printf '%s\n' "$VERSION"; exit 0; }
   validate_args
+  [ -z "$SSH_CONTROL_COMMAND" ] || fast_ssh_control
   STATE_FILE="$STATE_DIR/$NAME.state"
   case "$COMMAND" in setup) ;; *) acquire_lock ;; esac
   case "$COMMAND" in
