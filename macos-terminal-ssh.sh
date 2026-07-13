@@ -21,6 +21,7 @@ FORWARD_AGENT_SET=0
 SHELL_MODE="auto"
 SHELL_MODE_SET=0
 INTERNAL_LOCAL_SHELL=0
+OC2_RECOVERY=0
 LOCAL_SHELL_CONTROL_DIR=""
 LOCAL_SHELL_CONTROL_PATH=""
 LOCAL_SHELL_CONTROL_LOG=""
@@ -76,6 +77,7 @@ OPTIONS
   --no-mount         Initialize/prepare the VM but do not mount it locally
   --local-shell      Use a local prompt and run intercepted commands on EC2
   --remote-shell     Use a regular interactive SSH login shell
+  --oc2-recovery     Ask local OC2 to fix missing remote commands (off by default)
   --unmount          Unmount this VM's local SSHFS mount and exit
   --force            Force an unresponsive mount to unmount (with --unmount)
   -h, --help         Show help
@@ -89,6 +91,7 @@ EXAMPLES
   ./macos-terminal-ssh.sh mlbox --mount-dir "$HOME/mnt/mlbox"
   ./macos-terminal-ssh.sh mlbox --no-install-deps
   ./macos-terminal-ssh.sh mlbox --local-shell
+  ./macos-terminal-ssh.sh mlbox --local-shell --oc2-recovery
   ./macos-terminal-ssh.sh mlbox --remote-shell --no-mount
   ./macos-terminal-ssh.sh mlbox --no-mount
   ./macos-terminal-ssh.sh mlbox --unmount
@@ -101,10 +104,10 @@ BEHAVIOR
   SSHFS path and remote /data path synchronized. A persistent, private SSH
   connection is reused to avoid reconnecting for every command.
 
-  If a remote command exits because its executable is missing, the local OC2
-  CLI is shown diagnosing and applying a fix to the VM; retry the command after
-  OC2 finishes. SSH client warnings and normal connection-close messages are
-  hidden, but remote stderr and actionable SSH errors remain visible.
+  Missing remote commands return status 127 normally. Pass --oc2-recovery to
+  show the local OC2 CLI diagnosing and applying a fix to the VM; retry the
+  command after OC2 finishes. SSH client warnings and normal connection-close
+  messages are hidden, but remote stderr and actionable SSH errors remain visible.
 
   The launcher initializes verified persistent storage, installs missing mount
   dependencies, and mounts the VM workspace before opening the selected terminal.
@@ -198,6 +201,10 @@ parse_args() {
         set_shell_mode remote
         shift
         ;;
+      --oc2-recovery)
+        OC2_RECOVERY=1
+        shift
+        ;;
       --internal-local-shell)
         INTERNAL_LOCAL_SHELL=1
         shift
@@ -243,6 +250,7 @@ validate_args() {
     [ "$FORWARD_AGENT_SET" -eq 0 ] || die "SSH agent options conflict with --unmount"
     [ "$PROFILE_SET" -eq 0 ] || die "--profile conflicts with fully local --unmount"
     [ "$REGION_SET" -eq 0 ] || die "--region conflicts with fully local --unmount"
+    [ "$OC2_RECOVERY" -eq 0 ] || die "--oc2-recovery conflicts with --unmount"
   fi
   [ -n "$MOUNT_DIR" ] || MOUNT_DIR="$HOME/mnt/aws-ec2-vm/$NAME"
 }
@@ -296,6 +304,7 @@ launch() {
     [ "$PROFILE_SET" -eq 0 ] || command+=(--profile "$PROFILE")
     [ "$REGION_SET" -eq 0 ] || command+=(--region "$REGION")
     if [ "$FORWARD_AGENT" -eq 1 ]; then command+=(--forward-agent); else command+=(--no-forward-agent); fi
+    [ "$OC2_RECOVERY" -eq 0 ] || command+=(--oc2-recovery)
   else
     command=(/usr/bin/env "AWS_VM_STATE_DIR=$state_dir" /bin/bash "$vm_script" ssh "$NAME" --quiet)
     [ "$PROFILE_SET" -eq 0 ] || command+=(--profile "$PROFILE")
@@ -424,7 +433,7 @@ local_shell() {
         fi
       else
         status=$?
-        [ "$status" -ne 127 ] || missing_executable_recovery "$command_text" "$remote_cwd" "${remote_command[@]}"
+        [ "$status" -ne 127 ] || [ "$OC2_RECOVERY" -eq 0 ] || missing_executable_recovery "$command_text" "$remote_cwd" "${remote_command[@]}"
       fi
       continue
     fi
@@ -438,7 +447,7 @@ local_shell() {
     else
       status=$?
     fi
-    [ "$status" -ne 127 ] || missing_executable_recovery "$command_text" "$remote_cwd" "${remote_command[@]}"
+    [ "$status" -ne 127 ] || [ "$OC2_RECOVERY" -eq 0 ] || missing_executable_recovery "$command_text" "$remote_cwd" "${remote_command[@]}"
   done
   printf '\n'
   cleanup_local_shell
