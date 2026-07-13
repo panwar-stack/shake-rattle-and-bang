@@ -18,7 +18,9 @@ UNMOUNT=0
 FORCE=0
 APP_SET=0
 FORWARD_AGENT_SET=0
-LOCAL_SHELL=0
+SHELL_MODE="auto"
+SHELL_MODE_SET=0
+INTERNAL_LOCAL_SHELL=0
 LOCAL_SHELL_CONTROL_DIR=""
 LOCAL_SHELL_CONTROL_PATH=""
 LOCAL_SHELL_CONTROL_LOG=""
@@ -55,13 +57,14 @@ ensure_local_shell_master() {
 
 usage() {
   cat <<'EOF'
-macos-terminal-ssh.sh - open a macOS terminal for an EC2 VM
+macos-terminal-ssh.sh - open a local macOS terminal backed by an EC2 VM
 
 USAGE
   ./macos-terminal-ssh.sh [NAME] [OPTIONS]
 
 OPTIONS
-  --app APP          Terminal app: auto, iterm2, or terminal (default: auto)
+  --app APP          Terminal app: auto, iterm2, or terminal (default: auto;
+                     auto prefers iTerm2)
   --profile PROFILE  AWS CLI profile passed to aws-ec2-vm.sh
   --region REGION    AWS region passed to aws-ec2-vm.sh
   --forward-agent    Forward the local SSH agent (default)
@@ -70,6 +73,8 @@ OPTIONS
   --install-deps     Install macFUSE and SSHFS if missing (default)
   --no-install-deps  Require macFUSE and SSHFS to already be installed
   --no-mount         Initialize/prepare the VM but do not mount it locally
+  --local-shell      Use a local prompt and run intercepted commands on EC2
+  --remote-shell     Use a regular interactive SSH login shell
   --unmount          Unmount this VM's local SSHFS mount and exit
   --force            Force an unresponsive mount to unmount (with --unmount)
   -h, --help         Show help
@@ -82,22 +87,34 @@ EXAMPLES
   ./macos-terminal-ssh.sh mlbox --no-forward-agent
   ./macos-terminal-ssh.sh mlbox --mount-dir "$HOME/mnt/mlbox"
   ./macos-terminal-ssh.sh mlbox --no-install-deps
+  ./macos-terminal-ssh.sh mlbox --local-shell
+  ./macos-terminal-ssh.sh mlbox --remote-shell --no-mount
   ./macos-terminal-ssh.sh mlbox --no-mount
   ./macos-terminal-ssh.sh mlbox --unmount
 
-By default the launcher safely initializes a verified blank persistent volume
-(after exact typed confirmation), installs missing mount dependencies, mounts
-the VM's workspace at its name-scoped local mountpoint, then opens a local
-command shell rooted at the mounted workspace in iTerm2. Commands entered there
-run on EC2; cd keeps the local SSHFS directory and remote /data directory in
-sync. If a
-remote command is missing, the local shell can ask OC2 to diagnose and apply a
-fix before you retry it. Terminal.app and --no-mount use a direct remote login
-shell instead. The current public IP is looked up each time, and the local SSH
-agent is forwarded by default. No local shell profile or global user SSH config
-is modified. Prepare writes remote
-/etc/profile.d/aws-ec2-vm-data.sh for persistent tool paths, and mount maintains
-per-VM SSHFS config under the helper state directory.
+BEHAVIOR
+  By default, iTerm2 with a local mount uses the local shell; Terminal.app or
+  --no-mount uses the regular remote shell. Use --local-shell or --remote-shell
+  to select a mode explicitly. The local shell opens in the mounted workspace:
+  commands entered at its local prompt run on EC2, while cd keeps the local
+  SSHFS path and remote /data path synchronized. A persistent, private SSH
+  connection is reused to avoid reconnecting for every command.
+
+  If a remote command exits because its executable is missing, the local OC2
+  CLI is shown diagnosing and applying a fix to the VM; retry the command after
+  OC2 finishes. SSH client warnings and normal connection-close messages are
+  hidden, but remote stderr and actionable SSH errors remain visible.
+
+  The launcher initializes verified persistent storage, installs missing mount
+  dependencies, and mounts the VM workspace before opening the selected terminal.
+  A stale managed mount is safely verified, force-unmounted, and remounted.
+  Unrelated or mismatched mounts are never automatically unmounted.
+
+  The remote shell is a regular interactive SSH login. Mounting is independent
+  of shell mode; add --no-mount when no local SSHFS mount is wanted. The current
+  public IP is looked up each time, and SSH agent forwarding is enabled by
+  default. No local shell profile or global SSH configuration is modified.
+  Per-VM SSHFS configuration is stored under the helper state directory.
 
 SECURITY
   Agent forwarding lets the remote VM request signatures from your local keys.
@@ -108,6 +125,12 @@ EOF
 need_value() {
   [ "$#" -ge 2 ] || die "$1 requires a value"
   [ -n "$2" ] || die "$1 requires a non-empty value"
+}
+
+set_shell_mode() {
+  [ "$SHELL_MODE_SET" -eq 0 ] || die "--local-shell and --remote-shell may be specified only once"
+  SHELL_MODE="$1"
+  SHELL_MODE_SET=1
 }
 
 parse_args() {
@@ -167,7 +190,15 @@ parse_args() {
         shift
         ;;
       --local-shell)
-        LOCAL_SHELL=1
+        set_shell_mode local
+        shift
+        ;;
+      --remote-shell)
+        set_shell_mode remote
+        shift
+        ;;
+      --internal-local-shell)
+        INTERNAL_LOCAL_SHELL=1
         shift
         ;;
       -h|--help)
@@ -203,9 +234,11 @@ validate_args() {
   [ -z "$MOUNT_DIR" ] || case "$MOUNT_DIR" in *$'\n'*|*$'\r'*) die "--mount-dir must not contain newlines" ;; esac
   [ "$NO_MOUNT" -eq 0 ] || [ "$UNMOUNT" -eq 0 ] || die "--no-mount conflicts with --unmount"
   [ "$NO_MOUNT" -eq 0 ] || [ -z "$MOUNT_DIR" ] || die "--mount-dir conflicts with --no-mount"
+  [ "$SHELL_MODE" != "local" ] || [ "$NO_MOUNT" -eq 0 ] || die "--local-shell requires a local mount"
   [ "$UNMOUNT" -eq 1 ] || [ "$FORCE" -eq 0 ] || die "--force requires --unmount"
   if [ "$UNMOUNT" -eq 1 ]; then
     [ "$APP_SET" -eq 0 ] || die "--app conflicts with --unmount"
+    [ "$SHELL_MODE_SET" -eq 0 ] || die "shell mode options conflict with --unmount"
     [ "$FORWARD_AGENT_SET" -eq 0 ] || die "SSH agent options conflict with --unmount"
     [ "$PROFILE_SET" -eq 0 ] || die "--profile conflicts with fully local --unmount"
     [ "$REGION_SET" -eq 0 ] || die "--region conflicts with fully local --unmount"
@@ -257,8 +290,8 @@ launch() {
     *) state_dir="$PWD/$state_dir" ;;
   esac
 
-  if [ "$APP" = "iterm2" ] && [ "$NO_MOUNT" -eq 0 ]; then
-    command=(/usr/bin/env "AWS_VM_STATE_DIR=$state_dir" /bin/bash "$launcher_script" --local-shell "$NAME" --mount-dir "$MOUNT_DIR")
+  if [ "$NO_MOUNT" -eq 0 ] && { [ "$SHELL_MODE" = "local" ] || { [ "$SHELL_MODE" = "auto" ] && [ "$APP" = "iterm2" ]; }; }; then
+    command=(/usr/bin/env "AWS_VM_STATE_DIR=$state_dir" /bin/bash "$launcher_script" --internal-local-shell "$NAME" --mount-dir "$MOUNT_DIR")
     [ "$PROFILE_SET" -eq 0 ] || command+=(--profile "$PROFILE")
     [ "$REGION_SET" -eq 0 ] || command+=(--region "$REGION")
     if [ "$FORWARD_AGENT" -eq 1 ]; then command+=(--forward-agent); else command+=(--no-forward-agent); fi
@@ -414,7 +447,7 @@ main() {
   vm_script="$script_dir/aws-ec2-vm.sh"
   launcher_script="$script_dir/$(basename -- "${BASH_SOURCE[0]}")"
   [ -r "$vm_script" ] || die "sibling script is missing or unreadable: $vm_script"
-  if [ "$LOCAL_SHELL" -eq 1 ]; then
+  if [ "$INTERNAL_LOCAL_SHELL" -eq 1 ]; then
     local_shell "$vm_script"
     exit 0
   fi
