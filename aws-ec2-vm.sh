@@ -47,7 +47,8 @@ STATE_FILE=""
 AWS=()
 SSH_FORWARD_AGENT=0
 SSH_TTY=0
-SSH_QUIET=0
+SSH_QUIET="${AWS_VM_SSH_QUIET:-0}"
+SSH_QUIET_OPTION=0
 SSH_CONTROL_PATH="${AWS_VM_SSH_CONTROL_PATH:-}"
 SSH_CONTROL_COMMAND="${AWS_VM_SSH_CONTROL_COMMAND:-}"
 SSH_REMOTE_COMMAND=()
@@ -57,6 +58,7 @@ MOUNT_DIR=""
 MOUNT_DIR_EXPLICIT=0
 INSTALL_DEPS=0
 FORCE=0
+RECOVER_STALE_MOUNT=0
 STORAGE_UUID=""
 STORAGE_RESULT=""
 MOUNT_CONFIG=""
@@ -233,9 +235,10 @@ parse_args() {
       --cidr) need_value "$@"; PORT_CIDR="$2"; PORT_CIDR_EXPLICIT=1; shift 2 ;;
       --forward-agent) SSH_FORWARD_AGENT=1; shift ;;
       --tty) SSH_TTY=1; shift ;;
-      --quiet) SSH_QUIET=1; shift ;;
+      --quiet) SSH_QUIET=1; SSH_QUIET_OPTION=1; shift ;;
       --mount-dir) need_value "$@"; MOUNT_DIR="$2"; MOUNT_DIR_EXPLICIT=1; shift 2 ;;
       --install-deps) INSTALL_DEPS=1; shift ;;
+      --recover-stale-mount) RECOVER_STALE_MOUNT=1; shift ;;
       --force) FORCE=1; shift ;;
       --yes) YES=1; shift ;;
       --non-interactive) NON_INTERACTIVE=1; shift ;;
@@ -247,6 +250,7 @@ parse_args() {
 
 validate_args() {
   validate_name
+  case "$SSH_QUIET" in 0|1) ;; *) die "AWS_VM_SSH_QUIET must be 0 or 1" ;; esac
   is_uint "$VCPUS" || die "--vcpus must be a positive integer"
   is_uint "$MEMORY_GIB" || die "--memory must be a positive integer"
   is_uint "$DISK_GIB" || die "--disk must be a positive integer"
@@ -272,6 +276,7 @@ validate_args() {
   case "$STATE_DIR" in *[[:cntrl:]]*) die "AWS_VM_STATE_DIR must not contain control characters" ;; esac
   case "$COMMAND" in mount|unmount) ;; *) [ "$MOUNT_DIR_EXPLICIT" -eq 0 ] || die "--mount-dir is supported only by mount and unmount" ;; esac
   [ "$COMMAND" = "mount" ] || [ "$INSTALL_DEPS" -eq 0 ] || die "--install-deps is supported only by mount"
+  [ "$COMMAND" = "mount" ] || [ "$RECOVER_STALE_MOUNT" -eq 0 ] || die "--recover-stale-mount is supported only by mount"
   [ "$COMMAND" = "unmount" ] || [ "$FORCE" -eq 0 ] || die "--force is supported only by unmount"
   if [ "$COMMAND" = "unmount" ]; then
     [ "$PROFILE_EXPLICIT" -eq 0 ] || die "--profile is not used by fully local unmount"
@@ -283,7 +288,7 @@ validate_args() {
     [ "$YES" -eq 0 ] || die "init-storage does not accept --yes; exact TTY confirmation is required"
     [ "$NON_INTERACTIVE" -eq 0 ] || die "init-storage does not accept --non-interactive; exact TTY confirmation is required"
   fi
-  if [ "$COMMAND" != "ssh" ] && { [ "$SSH_FORWARD_AGENT" -eq 1 ] || [ "$SSH_TTY" -eq 1 ] || [ "$SSH_QUIET" -eq 1 ] || [ "${#SSH_REMOTE_COMMAND[@]}" -gt 0 ]; }; then
+  if [ "$COMMAND" != "ssh" ] && { [ "$SSH_FORWARD_AGENT" -eq 1 ] || [ "$SSH_TTY" -eq 1 ] || [ "$SSH_QUIET_OPTION" -eq 1 ] || [ "${#SSH_REMOTE_COMMAND[@]}" -gt 0 ]; }; then
     die "SSH options are supported only by ssh"
   fi
   if [ -n "$SSH_CONTROL_PATH" ]; then
@@ -1858,8 +1863,13 @@ canonicalize_mount_dir() {
   if [ "$create" -eq 1 ]; then
     if [ -e "$MOUNT_DIR" ]; then
       [ -d "$MOUNT_DIR" ] || die "mountpoint is not a directory: $MOUNT_DIR"
+    elif [ -n "$(mount_lines_for_target "$MOUNT_DIR")" ]; then
+      :
     else
-      mkdir -- "$MOUNT_DIR"
+      mkdir -- "$MOUNT_DIR" 2>/dev/null || {
+        [ -d "$MOUNT_DIR" ] || [ -n "$(mount_lines_for_target "$MOUNT_DIR")" ] ||
+          die "could not create mountpoint directory: $MOUNT_DIR"
+      }
     fi
   fi
 }
@@ -2138,11 +2148,18 @@ mount_storage() {
   if [ -e "$MOUNT_CONFIG" ] || [ -L "$MOUNT_CONFIG" ]; then
     load_mount_config
     if [ "$CONFIG_INSTANCE_ID" = "$INSTANCE_ID" ] && [ "$CONFIG_VOLUME_ID" = "$VOLUME_ID" ] &&
-       [ "$CONFIG_UUID" = "$STORAGE_UUID" ] && [ "$CONFIG_SOURCE" = "$source" ] && [ "$CONFIG_MOUNT_DIR" = "$MOUNT_DIR" ] &&
-       managed_mount_line "$source" "$MOUNT_DIR" && mount_health_ok "$MOUNT_DIR" "$NAME" "$INSTANCE_ID" "$VOLUME_ID" "$STORAGE_UUID"; then
-      info "SSHFS mount is healthy: name=$NAME mountpoint=$MOUNT_DIR"
-      printf 'Name: %s\nMountpoint: %s\n' "$NAME" "$MOUNT_DIR"
-      return
+       [ "$CONFIG_UUID" = "$STORAGE_UUID" ] && [ "$CONFIG_SOURCE" = "$source" ] && [ "$CONFIG_MOUNT_DIR" = "$MOUNT_DIR" ]; then
+      if managed_mount_line "$source" "$MOUNT_DIR"; then
+        if mount_health_ok "$MOUNT_DIR" "$NAME" "$INSTANCE_ID" "$VOLUME_ID" "$STORAGE_UUID"; then
+          info "SSHFS mount is healthy: name=$NAME mountpoint=$MOUNT_DIR"
+          printf 'Name: %s\nMountpoint: %s\n' "$NAME" "$MOUNT_DIR"
+          return
+        elif [ "$RECOVER_STALE_MOUNT" -eq 1 ]; then
+          warn "Force-unmounting the exact unhealthy managed SSHFS mount before remounting; active handles will error and in-flight writes may be lost."
+          /sbin/umount -f "$MOUNT_DIR"
+          [ -z "$(mount_lines_for_target "$MOUNT_DIR")" ] || die "mount is still present after stale-mount recovery: $MOUNT_DIR"
+        fi
+      fi
     fi
   fi
   lines="$(mount_lines_for_target "$MOUNT_DIR")"

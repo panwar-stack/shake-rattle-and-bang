@@ -215,11 +215,12 @@ validate_args() {
 
 vm_command() {
   local action="$1" vm_script="$2"
-  local -a command=(/bin/bash "$vm_script" "$action" "$NAME")
+  local -a command=(/usr/bin/env AWS_VM_SSH_QUIET=1 /bin/bash "$vm_script" "$action" "$NAME")
 
   if [ "$action" = "mount" ] || [ "$action" = "unmount" ]; then
     command+=(--mount-dir "$MOUNT_DIR")
     [ "$action" != "mount" ] || [ "$INSTALL_DEPS" -eq 0 ] || command+=(--install-deps)
+    [ "$action" != "mount" ] || command+=(--recover-stale-mount)
     [ "$action" != "unmount" ] || [ "$FORCE" -eq 0 ] || command+=(--force)
   fi
   if [ "$action" != "unmount" ]; then
@@ -262,7 +263,7 @@ launch() {
     [ "$REGION_SET" -eq 0 ] || command+=(--region "$REGION")
     if [ "$FORWARD_AGENT" -eq 1 ]; then command+=(--forward-agent); else command+=(--no-forward-agent); fi
   else
-    command=(/usr/bin/env "AWS_VM_STATE_DIR=$state_dir" /bin/bash "$vm_script" ssh "$NAME")
+    command=(/usr/bin/env "AWS_VM_STATE_DIR=$state_dir" /bin/bash "$vm_script" ssh "$NAME" --quiet)
     [ "$PROFILE_SET" -eq 0 ] || command+=(--profile "$PROFILE")
     [ "$REGION_SET" -eq 0 ] || command+=(--region "$REGION")
     [ "$FORWARD_AGENT" -eq 0 ] || command+=(--forward-agent)
