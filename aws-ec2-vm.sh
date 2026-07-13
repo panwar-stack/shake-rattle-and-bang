@@ -929,7 +929,9 @@ create_instance() {
   persistent="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName=='$DEVICE_NAME'].Ebs.DeleteOnTermination | [0]")"
   [ "$persistent" = "False" ] || [ "$persistent" = "false" ] || die "could not verify persistent attachment; volume $VOLUME_ID is retained, investigate before terminating"
   info "Waiting for EC2 health checks"
-  "${AWS[@]}" ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+  "${AWS[@]}" ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID" ||
+    die "EC2 health checks failed for instance $INSTANCE_ID"
+  info "EC2 health checks passed for instance $INSTANCE_ID"
   refresh_public_ip
 }
 
@@ -1452,7 +1454,7 @@ sync_live_instance_type() {
   if [ "$INSTANCE_TYPE_EXPLICIT" -eq 1 ] && [ "$saved_type" != "$live_type" ]; then
     die "instance $INSTANCE_ID is $live_type, not requested instance type $saved_type"
   fi
-  [ "$saved_type" != "$live_type" ] || return
+  [ "$saved_type" != "$live_type" ] || return 0
   warn "Saved instance type ${saved_type:-unknown} does not match live instance $INSTANCE_ID; using $live_type"
   INSTANCE_TYPE="$live_type"
   NVIDIA_GPU_PREFERRED=""
