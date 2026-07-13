@@ -31,6 +31,9 @@ MEMORY_SAVED=0
 INSTANCE_TYPE=""
 INSTANCE_TYPE_EXPLICIT=0
 SUBNET_ID=""
+SUBNET_ID_EXPLICIT=0
+AVAILABILITY_ZONE=""
+AVAILABILITY_ZONE_EXPLICIT=0
 SSH_CIDR=""
 PORT=""
 PORT_CIDR=""
@@ -40,6 +43,10 @@ MODEL_EXPLICIT=0
 OLLAMA_CIDR=""
 OLLAMA_READY="0"
 OLLAMA_MODE=""
+NVIDIA_GPU_PREFERRED=""
+GPU_CAPABILITY_INSTANCE_TYPE=""
+AMI_BINDINGS_PRESENT=0
+SAVED_INSTANCE_TYPE=""
 YES=0
 NON_INTERACTIVE=0
 STATE_DIR="${AWS_VM_STATE_DIR:-$HOME/.aws-ec2-vm}"
@@ -67,6 +74,9 @@ SSHFS_BIN=""
 readonly DATA_MARKER=".aws-ec2-vm-volume"
 readonly SSHFS_VERSION="3.7.6"
 readonly SSHFS_SHA256="6a1bcb31450a077e9cb1b7ff158c71de34db697c3c0da6cb362502131e495893"
+readonly OLLAMA_VERSION="0.31.2"
+readonly OLLAMA_SHA256="2c88f0f31a959bac5a3cad4cc5296ec568551d4aa79f548f554adb2b575b3133"
+readonly OLLAMA_ARCHIVE_URL="https://github.com/ollama/ollama/releases/download/v0.31.2/ollama-linux-amd64.tar.zst"
 
 # State fields. These are written after every resource-creating operation.
 ACCOUNT_ID=""
@@ -78,6 +88,9 @@ SG_ID=""
 KEY_NAME=""
 KEY_PATH=""
 AMI_ID=""
+AMI_INSTANCE_TYPE=""
+AMI_GPU_CLASS=""
+AMI_INSTANCE_TOKEN=""
 ROOT_DEVICE_NAME=""
 ROOT_DISK_GIB="$DEFAULT_ROOT_DISK_GIB"
 PUBLIC_IP=""
@@ -115,6 +128,8 @@ CREATE OPTIONS
   --instance-type TYPE  Use this EC2 type instead of resolving vCPU/RAM
   --disk GIB            Persistent encrypted gp3 data disk (default: 50)
   --subnet-id ID        Subnet to use; otherwise a default subnet is selected
+  --availability-zone AZ
+                        Select a default subnet in AZ (create only)
   --ssh-cidr CIDR       IPv4 CIDR allowed to SSH; default: your public IP /32
   --model MODEL         Opt into Ollama and pull/test MODEL (recommended: gemma3:4b)
   --cidr CIDR           IPv4 CIDR allowed to reach Ollama; requires Ollama mode
@@ -145,6 +160,7 @@ EXAMPLES
   ./aws-ec2-vm.sh create                    # small 2 vCPU / 4 GiB development VM
   ./aws-ec2-vm.sh create llmbox --model gemma4 --instance-type g6.xlarge --disk 100
   ./aws-ec2-vm.sh create devbox --vcpus 4 --memory 8 --disk 200
+  ./aws-ec2-vm.sh create devbox --region us-east-1 --availability-zone us-east-1b
   ./aws-ec2-vm.sh status mlbox
   ./aws-ec2-vm.sh ssh mlbox
   ./aws-ec2-vm.sh ssh mlbox --forward-agent -- git status
@@ -229,7 +245,8 @@ parse_args() {
       --memory) need_value "$@"; MEMORY_GIB="$2"; MEMORY_EXPLICIT=1; shift 2 ;;
       --disk) need_value "$@"; DISK_GIB="$2"; DISK_EXPLICIT=1; shift 2 ;;
       --instance-type) need_value "$@"; INSTANCE_TYPE="$2"; INSTANCE_TYPE_EXPLICIT=1; shift 2 ;;
-      --subnet-id) need_value "$@"; SUBNET_ID="$2"; shift 2 ;;
+      --subnet-id) need_value "$@"; SUBNET_ID="$2"; SUBNET_ID_EXPLICIT=1; shift 2 ;;
+      --availability-zone) need_value "$@"; AVAILABILITY_ZONE="$2"; AVAILABILITY_ZONE_EXPLICIT=1; shift 2 ;;
       --ssh-cidr) need_value "$@"; SSH_CIDR="$2"; shift 2 ;;
       --model) need_value "$@"; MODEL="$2"; MODEL_EXPLICIT=1; shift 2 ;;
       --cidr) need_value "$@"; PORT_CIDR="$2"; PORT_CIDR_EXPLICIT=1; shift 2 ;;
@@ -257,6 +274,10 @@ validate_args() {
   case "$VCPUS:$MEMORY_GIB:$DISK_GIB" in *:0*|0*) die "numeric values must not have leading zeros" ;; esac
   [ "$DISK_GIB" -le 16384 ] || die "--disk exceeds gp3's 16384 GiB limit"
   case "$REGION" in *[!a-z0-9-]*) [ -z "$REGION" ] || die "invalid region: $REGION" ;; esac
+  if [ "$AVAILABILITY_ZONE_EXPLICIT" -eq 1 ]; then
+    case "$AVAILABILITY_ZONE" in ''|*[!a-z0-9-]*) die "invalid Availability Zone: $AVAILABILITY_ZONE" ;; esac
+  fi
+  [ "$SUBNET_ID_EXPLICIT" -eq 0 ] || [ -n "$SUBNET_ID" ] || die "--subnet-id requires a non-empty value"
   case "$PROFILE" in ''|*[!a-zA-Z0-9_+=,.@-]*) die "invalid profile name" ;; esac
   [ -z "$SSH_CIDR" ] || valid_cidr "$SSH_CIDR" || die "invalid IPv4 CIDR: $SSH_CIDR"
   [[ "$MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$ ]] || die "invalid Ollama model: $MODEL"
@@ -269,6 +290,7 @@ validate_args() {
   [ -z "$PORT_CIDR" ] || valid_cidr "$PORT_CIDR" || die "invalid IPv4 CIDR: $PORT_CIDR"
   [ "$COMMAND" = "expose-port" ] || [ "$COMMAND" = "create" ] || [ -z "$PORT_CIDR" ] || die "--cidr is supported only by create and expose-port"
   [ "$COMMAND" = "create" ] || [ "$MODEL_EXPLICIT" -eq 0 ] || die "--model is supported only by create"
+  [ "$COMMAND" = "create" ] || [ "$AVAILABILITY_ZONE_EXPLICIT" -eq 0 ] || die "--availability-zone is supported only by create"
   if [ "$MOUNT_DIR_EXPLICIT" -eq 1 ]; then
     [ -n "$MOUNT_DIR" ] || die "--mount-dir requires a non-empty path"
     case "$MOUNT_DIR" in *[[:cntrl:]]*) die "--mount-dir must not contain control characters" ;; esac
@@ -340,7 +362,7 @@ save_state() {
   local tmp="$STATE_FILE.tmp.$$" key value
   umask 077
   : > "$tmp"
-  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID INSTANCE_TYPE VCPUS MEMORY_GIB DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_MODE OLLAMA_CIDR OLLAMA_READY; do
+  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID AMI_INSTANCE_TYPE AMI_GPU_CLASS AMI_INSTANCE_TOKEN INSTANCE_TYPE VCPUS MEMORY_GIB DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_MODE OLLAMA_CIDR OLLAMA_READY; do
     eval "value=\${$key}"
     case "$value" in *$'\n'*|*$'\r'*) rm -f "$tmp"; die "state value contains a newline" ;; esac
     printf '%s=%s\n' "$key" "$value" >> "$tmp"
@@ -361,13 +383,22 @@ load_state() {
       INSTANCE_ID) INSTANCE_ID="$value" ;;
       VOLUME_ID) VOLUME_ID="$value" ;;
       VPC_ID) VPC_ID="$value" ;;
-      SUBNET_ID) SUBNET_ID="$value" ;;
+      SUBNET_ID)
+        if [ "$SUBNET_ID_EXPLICIT" -eq 1 ]; then
+          [ -z "$value" ] || [ "$SUBNET_ID" = "$value" ] || die "state uses subnet '$value', not requested '$SUBNET_ID'"
+        else
+          SUBNET_ID="$value"
+        fi
+        ;;
       AZ) AZ="$value" ;;
       SG_ID) SG_ID="$value" ;;
       KEY_NAME) KEY_NAME="$value" ;;
       KEY_PATH) KEY_PATH="$value" ;;
       AMI_ID) AMI_ID="$value" ;;
-      INSTANCE_TYPE) [ "$INSTANCE_TYPE_EXPLICIT" -eq 1 ] || INSTANCE_TYPE="$value" ;;
+      AMI_INSTANCE_TYPE) AMI_INSTANCE_TYPE="$value"; AMI_BINDINGS_PRESENT=1 ;;
+      AMI_GPU_CLASS) AMI_GPU_CLASS="$value"; AMI_BINDINGS_PRESENT=1 ;;
+      AMI_INSTANCE_TOKEN) AMI_INSTANCE_TOKEN="$value"; AMI_BINDINGS_PRESENT=1 ;;
+      INSTANCE_TYPE) SAVED_INSTANCE_TYPE="$value"; [ "$INSTANCE_TYPE_EXPLICIT" -eq 1 ] || INSTANCE_TYPE="$value" ;;
       VCPUS) VCPUS_SAVED=1; [ "$VCPUS_EXPLICIT" -eq 1 ] || VCPUS="$value" ;;
       MEMORY_GIB) MEMORY_SAVED=1; [ "$MEMORY_EXPLICIT" -eq 1 ] || MEMORY_GIB="$value" ;;
       DISK_GIB) [ "$DISK_EXPLICIT" -eq 1 ] || DISK_GIB="$value" ;;
@@ -399,6 +430,7 @@ load_state() {
   case "$VOLUME_ID" in ''|vol-[a-zA-Z0-9]*) ;; *) die "invalid volume ID in state" ;; esac
   case "$SG_ID" in ''|sg-[a-zA-Z0-9]*) ;; *) die "invalid security group ID in state" ;; esac
   case "$INSTANCE_READY" in 0|1) ;; *) die "invalid readiness marker in state" ;; esac
+  case "$AMI_GPU_CLASS" in ''|generic|nvidia) ;; *) die "invalid AMI GPU class in state" ;; esac
   is_uint "$VCPUS" || die "invalid vCPU count in state"
   is_uint "$MEMORY_GIB" || die "invalid memory size in state"
   case "$VCPUS:$MEMORY_GIB" in *:0*|0*) die "invalid numeric value with leading zeros in state" ;; esac
@@ -626,14 +658,28 @@ discover_port_cidr() {
   info "TCP port $PORT access restricted to $PORT_CIDR"
 }
 
+apply_requested_availability_zone() {
+  [ "$AVAILABILITY_ZONE_EXPLICIT" -eq 1 ] || return 0
+  case "$AVAILABILITY_ZONE" in
+    "$REGION"[a-z]) ;;
+    *) die "Availability Zone $AVAILABILITY_ZONE is not in region $REGION" ;;
+  esac
+  [ -z "$AZ" ] || [ "$AZ" = "$AVAILABILITY_ZONE" ] ||
+    die "state uses Availability Zone $AZ, not requested $AVAILABILITY_ZONE"
+  AZ="$AVAILABILITY_ZONE"
+}
+
 resolve_existing_volume() {
   [ -n "$VOLUME_ID" ] || return 0
-  local result state attachment attached_state
+  local result volume_az state attachment attached_state
   result="$(aws_text ec2 describe-volumes --volume-ids "$VOLUME_ID" --query 'Volumes[0].[AvailabilityZone,State,Attachments[0].InstanceId]')" || die "cannot inspect persistent volume $VOLUME_ID"
-  AZ="$(printf '%s\n' "$result" | awk '{print $1}')"
+  volume_az="$(printf '%s\n' "$result" | awk '{print $1}')"
   state="$(printf '%s\n' "$result" | awk '{print $2}')"
   attachment="$(printf '%s\n' "$result" | awk '{print $3}')"
-  [ -n "$AZ" ] && [ "$AZ" != "None" ] || die "persistent volume $VOLUME_ID no longer exists"
+  [ -n "$volume_az" ] && [ "$volume_az" != "None" ] || die "persistent volume $VOLUME_ID no longer exists"
+  [ -z "$AZ" ] || [ "$AZ" = "$volume_az" ] ||
+    die "persistent volume $VOLUME_ID is in $volume_az, not selected Availability Zone $AZ"
+  AZ="$volume_az"
   case "$state" in
     available) ;;
     in-use)
@@ -661,7 +707,7 @@ resolve_subnet() {
     subnet_az="$(printf '%s\n' "$result" | awk '{print $2}')"
     subnet_state="$(printf '%s\n' "$result" | awk '{print $3}')"
     [ "$subnet_state" = "available" ] || die "subnet $SUBNET_ID is not available"
-    [ -z "$AZ" ] || [ "$AZ" = "$subnet_az" ] || die "persistent EBS is in $AZ but subnet is in $subnet_az"
+    [ -z "$AZ" ] || [ "$AZ" = "$subnet_az" ] || die "selected Availability Zone is $AZ but subnet $SUBNET_ID is in $subnet_az"
     AZ="$subnet_az"
     return
   fi
@@ -706,6 +752,26 @@ resolve_instance_type() {
   done
   [ -n "$INSTANCE_TYPE" ] || INSTANCE_TYPE="$(printf '%s\n' "$candidates" | awk '{print $1}')"
   info "Selected $INSTANCE_TYPE for exactly $VCPUS vCPU / $MEMORY_GIB GiB (override with --instance-type)"
+}
+
+resolve_gpu_capability() {
+  if [ "$GPU_CAPABILITY_INSTANCE_TYPE" = "$INSTANCE_TYPE" ] && [ -n "$NVIDIA_GPU_PREFERRED" ]; then return 0; fi
+  local manufacturers manufacturer
+  manufacturers="$(aws_text ec2 describe-instance-types --instance-types "$INSTANCE_TYPE" --query 'InstanceTypes[0].GpuInfo.Gpus[].Manufacturer')" ||
+    die "cannot inspect GPU capabilities for instance type $INSTANCE_TYPE"
+  GPU_CAPABILITY_INSTANCE_TYPE="$INSTANCE_TYPE"
+  case "$manufacturers" in
+    ''|None) NVIDIA_GPU_PREFERRED="0"; return ;;
+  esac
+  NVIDIA_GPU_PREFERRED="1"
+  for manufacturer in $manufacturers; do
+    if [ "$manufacturer" != "NVIDIA" ]; then
+      NVIDIA_GPU_PREFERRED="0"
+      warn "Instance type $INSTANCE_TYPE has $manufacturer GPU hardware; using generic Amazon Linux 2023 and CPU-backed Ollama"
+      return
+    fi
+  done
+  info "Detected NVIDIA GPU capability for $INSTANCE_TYPE; using the AWS GPU AMI driver when healthy"
 }
 
 verify_instance_offering() {
@@ -764,8 +830,46 @@ ensure_volume() {
 }
 
 resolve_ami() {
+  local parameter gpu_class bound_instance_type binding_conflict=0
+  resolve_gpu_capability
+  if [ "$NVIDIA_GPU_PREFERRED" = "1" ]; then gpu_class="nvidia"; else gpu_class="generic"; fi
+  if [ -n "$AMI_ID" ]; then
+    bound_instance_type="$AMI_INSTANCE_TYPE"
+    [ -n "$bound_instance_type" ] || bound_instance_type="$SAVED_INSTANCE_TYPE"
+    [ -z "$bound_instance_type" ] || [ "$bound_instance_type" = "$INSTANCE_TYPE" ] || binding_conflict=1
+    [ -z "$AMI_GPU_CLASS" ] || [ "$AMI_GPU_CLASS" = "$gpu_class" ] || binding_conflict=1
+    [ -z "$AMI_INSTANCE_TOKEN" ] || [ -z "$INSTANCE_TOKEN" ] || [ "$AMI_INSTANCE_TOKEN" = "$INSTANCE_TOKEN" ] || binding_conflict=1
+    if [ "$binding_conflict" -eq 1 ]; then
+      if [ -z "$INSTANCE_ID" ] && [ -n "$INSTANCE_TOKEN" ]; then
+        die "saved launch token $INSTANCE_TOKEN is bound to different AMI or instance settings; refusing a non-idempotent replacement"
+      fi
+      info "Refreshing the AMI selection for instance type $INSTANCE_TYPE ($gpu_class)"
+      AMI_ID=""
+      AMI_INSTANCE_TYPE=""
+      AMI_GPU_CLASS=""
+      AMI_INSTANCE_TOKEN=""
+      [ -n "$INSTANCE_ID" ] || INSTANCE_TOKEN=""
+    else
+      if [ "$AMI_BINDINGS_PRESENT" -eq 0 ] && [ -n "$INSTANCE_TOKEN" ]; then
+        warn "Legacy state has an unresolved launch token; preserving its saved AMI for an idempotent retry"
+      fi
+      [ -n "$AMI_INSTANCE_TYPE" ] || AMI_INSTANCE_TYPE="$INSTANCE_TYPE"
+      [ -n "$AMI_GPU_CLASS" ] || AMI_GPU_CLASS="$gpu_class"
+      if [ -z "$INSTANCE_TOKEN" ] && [ -n "$AMI_INSTANCE_TOKEN" ]; then INSTANCE_TOKEN="$AMI_INSTANCE_TOKEN"; fi
+      [ -n "$AMI_INSTANCE_TOKEN" ] || AMI_INSTANCE_TOKEN="$INSTANCE_TOKEN"
+    fi
+  fi
   if [ -z "$AMI_ID" ]; then
-    AMI_ID="$(aws_text ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value)"
+    if [ "$NVIDIA_GPU_PREFERRED" = "1" ]; then
+      parameter="/aws/service/ecs/optimized-ami/amazon-linux-2023/gpu/recommended/image_id"
+    else
+      parameter="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+    fi
+    AMI_ID="$(aws_text ssm get-parameter --name "$parameter" --query Parameter.Value)" ||
+      die "could not resolve the required Amazon Linux 2023 AMI from SSM parameter $parameter"
+    AMI_INSTANCE_TYPE="$INSTANCE_TYPE"
+    AMI_GPU_CLASS="$gpu_class"
+    AMI_INSTANCE_TOKEN="$INSTANCE_TOKEN"
   fi
   [ -n "$AMI_ID" ] && [ "$AMI_ID" != "None" ] || die "could not resolve Amazon Linux 2023 AMI"
   if [ "$OLLAMA_MODE" = "1" ]; then
@@ -782,9 +886,9 @@ create_instance() {
   local prior_state="" attachment=""
   local -a root_mapping=()
   if [ -n "$INSTANCE_ID" ]; then
-    prior_state="$(instance_state)"
+    prior_state="$(instance_state)" || return 1
     case "$prior_state" in
-      terminated|not-found|None|'') INSTANCE_ID=""; INSTANCE_TOKEN=""; INSTANCE_READY="0"; PUBLIC_IP=""; save_state ;;
+      terminated|not-found|None|'') INSTANCE_ID=""; INSTANCE_TOKEN=""; AMI_INSTANCE_TOKEN=""; INSTANCE_READY="0"; PUBLIC_IP=""; save_state ;;
       pending|running) info "Resuming setup for $INSTANCE_ID ($prior_state)" ;;
       stopped) info "Starting partial instance $INSTANCE_ID to finish setup"; aws_text ec2 start-instances --instance-ids "$INSTANCE_ID" --query 'StartingInstances[0].CurrentState.Name' >/dev/null ;;
       shutting-down|stopping) die "instance $INSTANCE_ID is $prior_state; wait and retry" ;;
@@ -792,7 +896,11 @@ create_instance() {
     esac
   fi
   if [ -z "$INSTANCE_ID" ]; then
-    if [ -z "$INSTANCE_TOKEN" ]; then INSTANCE_TOKEN="i-$ACCOUNT_ID-$(date +%s)-$$"; save_state; fi
+    if [ -z "$INSTANCE_TOKEN" ]; then
+      INSTANCE_TOKEN="i-$ACCOUNT_ID-$(date +%s)-$$"
+      AMI_INSTANCE_TOKEN="$INSTANCE_TOKEN"
+      save_state
+    fi
     if [ "$OLLAMA_MODE" = "1" ]; then
       root_mapping=(--block-device-mappings "[{\"DeviceName\":\"$ROOT_DEVICE_NAME\",\"Ebs\":{\"DeleteOnTermination\":true,\"Encrypted\":true,\"VolumeType\":\"gp3\",\"VolumeSize\":$ROOT_DISK_GIB}}]")
     else
@@ -900,11 +1008,33 @@ ensure_ollama_remote() {
   prepare_ssh_endpoint
   build_ssh_args
   info "Ensuring Ollama service and model $MODEL"
-  # The model argument is passed separately and interpreted only as data remotely.
+  # Remote values are passed separately and interpreted only as data.
   # shellcheck disable=SC2029
-  ssh "${SSH_ARGS[@]}" "ec2-user@$PUBLIC_IP" "sudo -n /bin/bash -s -- $(shell_quote "$MODEL")" <<'REMOTE_OLLAMA' || die "Ollama provisioning failed on $INSTANCE_ID"
+  ssh "${SSH_ARGS[@]}" "ec2-user@$PUBLIC_IP" "sudo -n /bin/bash -s -- $(shell_quote "$MODEL") $(shell_quote "$NVIDIA_GPU_PREFERRED") $(shell_quote "$OLLAMA_VERSION") $(shell_quote "$OLLAMA_SHA256") $(shell_quote "$OLLAMA_ARCHIVE_URL")" <<'REMOTE_OLLAMA' || die "Ollama provisioning failed on $INSTANCE_ID"
 set -Eeuo pipefail
 model="$1"
+gpu_preferred="$2"
+ollama_version="$3"
+ollama_sha256="$4"
+ollama_archive_url="$5"
+
+case "$gpu_preferred" in
+  0|1) ;;
+  *) printf 'Error: invalid GPU preference passed to remote provisioning\n' >&2; exit 1 ;;
+esac
+if ! [[ "$ollama_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  printf 'Error: invalid Ollama version passed to remote provisioning\n' >&2
+  exit 1
+fi
+if [ "${#ollama_sha256}" -ne 64 ] || [[ "$ollama_sha256" == *[!0-9a-f]* ]]; then
+  printf 'Error: invalid Ollama checksum passed to remote provisioning\n' >&2
+  exit 1
+fi
+expected_archive_url="https://github.com/ollama/ollama/releases/download/v${ollama_version}/ollama-linux-amd64.tar.zst"
+if [ "$ollama_archive_url" != "$expected_archive_url" ]; then
+  printf 'Error: invalid Ollama archive URL passed to remote provisioning\n' >&2
+  exit 1
+fi
 
 [ "$(uname -m)" = "x86_64" ] || { printf 'Error: Ollama provisioning requires x86_64\n' >&2; exit 1; }
 . /etc/os-release
@@ -913,13 +1043,98 @@ model="$1"
   exit 1
 }
 
-if ! command -v ollama >/dev/null 2>&1 || ! systemctl cat ollama.service >/dev/null 2>&1; then
-  command -v zstd >/dev/null 2>&1 || dnf install -y zstd
-  tmp="$(mktemp /tmp/ollama-install.XXXXXX)"
-  trap 'rm -f -- "$tmp"' EXIT
-  curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp" https://ollama.com/install.sh
-  /bin/sh "$tmp"
-  rm -f -- "$tmp"
+if ! command -v curl >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+  dnf install -y curl zstd jq
+fi
+
+install_state_dir=/var/lib/aws-ec2-vm
+install_in_progress=$install_state_dir/ollama-install.in-progress
+install_complete=$install_state_dir/ollama-install.complete
+install -d -o root -g root -m 0755 "$install_state_dir"
+expected_marker="$(printf 'source=%s\nversion=%s\nsha256=%s' "$ollama_archive_url" "$ollama_version" "$ollama_sha256")"
+version_pattern="(^|[^0-9.])${ollama_version//./\\.}([^0-9.]|$)"
+ollama_version_matches() {
+  ollama --version 2>/dev/null | grep -Eq "$version_pattern"
+}
+repair_archive=0
+if ! command -v ollama >/dev/null 2>&1; then
+  repair_archive=1
+elif [ -e "$install_in_progress" ]; then
+  repair_archive=1
+elif [ ! -s "$install_complete" ]; then
+  repair_archive=1
+elif [ "$(cat "$install_complete")" != "$expected_marker" ]; then
+  repair_archive=1
+elif ! ollama_version_matches; then
+  repair_archive=1
+fi
+
+if [ "$repair_archive" -eq 1 ]; then
+  printf '%s\n' "$expected_marker" > "$install_in_progress"
+  chown root:root "$install_in_progress"
+  chmod 0644 "$install_in_progress"
+  archive="$(mktemp /tmp/ollama-linux-amd64.XXXXXX.tar.zst)"
+  marker_tmp=""
+  trap 'rm -f -- "$archive"; [ -z "$marker_tmp" ] || rm -f -- "$marker_tmp"' EXIT
+  curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 20 --max-time 1800 \
+    --proto '=https' --tlsv1.2 -o "$archive" "$ollama_archive_url"
+  printf '%s  %s\n' "$ollama_sha256" "$archive" | sha256sum -c - >/dev/null
+  tar --zstd -tf "$archive" >/dev/null
+  tar --zstd -xf "$archive" -C /usr
+  command -v ollama >/dev/null 2>&1 || { printf 'Error: Ollama archive did not install the ollama command\n' >&2; exit 1; }
+  ollama_version_matches || { printf 'Error: installed Ollama command does not match pinned version %s\n' "$ollama_version" >&2; exit 1; }
+  marker_tmp="$(mktemp "$install_state_dir/ollama-install.complete.XXXXXX")"
+  printf '%s\n' "$expected_marker" > "$marker_tmp"
+  chown root:root "$marker_tmp"
+  chmod 0644 "$marker_tmp"
+  mv -f -- "$marker_tmp" "$install_complete"
+  rm -f -- "$archive"
+  rm -f -- "$install_in_progress"
+  trap - EXIT
+fi
+command -v ollama >/dev/null 2>&1 || { printf 'Error: Ollama archive did not install the ollama command\n' >&2; exit 1; }
+
+unit_path=/etc/systemd/system/ollama.service
+write_unit=0
+if ! systemctl cat ollama.service >/dev/null 2>&1; then
+  write_unit=1
+elif [ -f "$unit_path" ] && grep -Fqx '# Managed by aws-ec2-vm.sh' "$unit_path"; then
+  write_unit=1
+elif [ -f "$unit_path" ] && ! grep -Eq '^ExecStart=.*[/ ]ollama[[:space:]]+serve([[:space:]]|$)' "$unit_path"; then
+  write_unit=1
+elif [ -f "$unit_path" ] && grep -Fqx 'Description=Ollama Service' "$unit_path"; then
+  for required_line in '[Service]' 'User=ollama' 'Group=ollama' 'Restart=always' '[Install]' 'WantedBy=default.target'; do
+    if ! grep -Fqx "$required_line" "$unit_path"; then write_unit=1; break; fi
+  done
+  grep -Eq '^ExecStart=.*[/ ]ollama[[:space:]]+serve([[:space:]]|$)' "$unit_path" || write_unit=1
+fi
+if [ "$write_unit" -eq 1 ]; then
+  getent group ollama >/dev/null 2>&1 || groupadd --system ollama
+  id -u ollama >/dev/null 2>&1 || useradd --system --gid ollama --home-dir /usr/share/ollama --create-home --shell /sbin/nologin ollama
+  install -d -o ollama -g ollama -m 0755 /usr/share/ollama
+  ollama_bin="$(command -v ollama)"
+  unit_tmp="$(mktemp "$unit_path.XXXXXX")"
+  trap 'rm -f -- "$unit_tmp"' EXIT
+  cat > "$unit_tmp" <<EOF
+# Managed by aws-ec2-vm.sh
+[Unit]
+Description=Ollama Service
+After=network-online.target
+
+[Service]
+ExecStart=$ollama_bin serve
+User=ollama
+Group=ollama
+Restart=always
+RestartSec=3
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+[Install]
+WantedBy=default.target
+EOF
+  chown root:root "$unit_tmp"
+  chmod 0644 "$unit_tmp"
+  mv -f -- "$unit_tmp" "$unit_path"
   trap - EXIT
 fi
 
@@ -930,28 +1145,120 @@ Environment="OLLAMA_HOST=0.0.0.0:11434"
 EOF
 chown root:root /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf
 chmod 0644 /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf
-systemctl daemon-reload
-systemctl enable --now ollama.service
-systemctl restart ollama.service
 
-ready=0
-for attempt in $(seq 1 30); do
-  if curl -fsS --max-time 5 http://127.0.0.1:11434/api/tags >/dev/null; then
-    ready=1
-    break
+cpu_dropin=/etc/systemd/system/ollama.service.d/aws-ec2-vm-cpu.conf
+force_cpu_mode() {
+  cat > "$cpu_dropin" <<'EOF' || return 1
+[Service]
+Environment="CUDA_VISIBLE_DEVICES=-1"
+EOF
+  chown root:root "$cpu_dropin" || return 1
+  chmod 0644 "$cpu_dropin" || return 1
+  gpu_mode=cpu
+}
+
+gpu_mode=cpu
+if [ "$gpu_preferred" -eq 1 ]; then
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    printf 'Warning: nvidia-smi is unavailable from the AWS GPU AMI; forcing Ollama CPU mode\n' >&2
+  elif ! nvidia-smi >/dev/null; then
+    printf 'Warning: nvidia-smi cannot communicate with the AWS GPU AMI driver; forcing Ollama CPU mode (inspect journalctl -k)\n' >&2
+  elif ! command -v modprobe >/dev/null 2>&1; then
+    printf 'Warning: modprobe is unavailable; forcing Ollama CPU mode\n' >&2
+  elif ! modprobe nvidia_uvm; then
+    printf 'Warning: the AWS GPU AMI driver could not load nvidia_uvm; forcing Ollama CPU mode (inspect journalctl -k)\n' >&2
+  elif ! grep -q '^nvidia_uvm ' /proc/modules; then
+    printf 'Warning: nvidia_uvm is not loaded; forcing Ollama CPU mode\n' >&2
+  else
+    gpu_mode=gpu
+    rm -f -- "$cpu_dropin"
+    printf 'Info: NVIDIA driver checks passed; attempting Ollama GPU inference\n' >&2
   fi
-  [ "$attempt" -eq 30 ] || sleep 2
-done
-[ "$ready" -eq 1 ] || { printf 'Error: Ollama API did not become ready\n' >&2; exit 1; }
+fi
+if [ "$gpu_mode" != "gpu" ]; then
+  force_cpu_mode || { printf 'Error: could not configure the Ollama CPU-mode systemd drop-in\n' >&2; exit 1; }
+fi
 
-if ! ollama list | awk 'NR > 1 { print $1 }' | grep -Fxq -- "$model"; then
+wait_for_ollama() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    if curl -fsS --max-time 5 http://127.0.0.1:11434/api/tags >/dev/null; then return 0; fi
+    [ "$attempt" -eq 30 ] || sleep 2
+  done
+  return 1
+}
+restart_in_cpu_mode() {
+  force_cpu_mode || return 1
+  systemctl daemon-reload || return 1
+  systemctl restart ollama.service || return 1
+  wait_for_ollama
+}
+
+systemctl daemon-reload
+systemctl enable ollama.service
+if ! systemctl restart ollama.service; then
+  if [ "$gpu_mode" = "gpu" ]; then
+    printf 'Warning: Ollama service could not restart on the GPU path; forcing CPU mode and retrying once\n' >&2
+    restart_in_cpu_mode || { printf 'Error: Ollama service did not recover in CPU mode; inspect systemctl status ollama.service\n' >&2; exit 1; }
+  else
+    printf 'Error: Ollama service could not restart in CPU mode; inspect systemctl status ollama.service\n' >&2
+    exit 1
+  fi
+elif ! wait_for_ollama; then
+  if [ "$gpu_mode" = "gpu" ]; then
+    printf 'Warning: Ollama API did not start on the GPU path; forcing CPU mode and retrying once\n' >&2
+    restart_in_cpu_mode || { printf 'Error: Ollama API did not recover in CPU mode; inspect systemctl status ollama.service\n' >&2; exit 1; }
+  else
+    printf 'Error: Ollama API did not become ready in CPU mode; inspect systemctl status ollama.service\n' >&2
+    exit 1
+  fi
+fi
+
+case "${model##*/}" in *:*) model_latest="$model" ;; *) model_latest="$model:latest" ;; esac
+if ! ollama list | awk 'NR > 1 { print $1 }' | grep -Fxq -- "$model_latest"; then
   ollama pull "$model"
 fi
 response="$(mktemp /tmp/ollama-smoke.XXXXXX)"
 trap 'rm -f -- "$response"' EXIT
-printf '{"model":"%s","prompt":"Reply with OK.","stream":false}' "$model" |
-  curl -fsS --max-time 300 -H 'Content-Type: application/json' --data-binary @- -o "$response" http://127.0.0.1:11434/api/generate
-grep -q '"response"' "$response" || { printf 'Error: Ollama smoke test returned an invalid response\n' >&2; exit 1; }
+run_smoke() {
+  : > "$response"
+  if ! printf '{"model":"%s","prompt":"Reply with OK.","stream":false}' "$model" |
+    curl -fsS --max-time 300 -H 'Content-Type: application/json' --data-binary @- -o "$response" http://127.0.0.1:11434/api/generate; then
+    return 1
+  fi
+  jq -e '(.done == true) and (.response | type == "string" and length > 0) and (has("error") | not)' "$response" >/dev/null 2>&1
+}
+
+if ! run_smoke; then
+  if [ "$gpu_mode" = "gpu" ]; then
+    printf 'Warning: GPU-path smoke inference failed; forcing CPU mode and retrying once\n' >&2
+    restart_in_cpu_mode || { printf 'Error: Ollama API did not recover in CPU mode; inspect systemctl status ollama.service\n' >&2; exit 1; }
+    run_smoke || { printf 'Error: Ollama smoke inference also failed in CPU mode; inspect journalctl -u ollama.service\n' >&2; exit 1; }
+  else
+    printf 'Error: Ollama smoke inference failed in CPU mode; inspect journalctl -u ollama.service\n' >&2
+    exit 1
+  fi
+fi
+
+model_name="$model_latest"
+model_digest=""
+if tags_json="$(curl -fsS --max-time 10 http://127.0.0.1:11434/api/tags)"; then
+  if resolved_name="$(printf '%s' "$tags_json" | jq -r --arg requested "$model" --arg latest "$model_latest" 'first(.models[]? | select(.name == $requested or .model == $requested or .name == $latest or .model == $latest) | (.name // .model)) // empty')"; then
+    [ -z "$resolved_name" ] || model_name="$resolved_name"
+  fi
+  model_digest="$(printf '%s' "$tags_json" | jq -r --arg name "$model_name" 'first(.models[]? | select(.name == $name or .model == $name) | .digest) // empty' 2>/dev/null || true)"
+fi
+
+if ps_json="$(curl -fsS --max-time 10 http://127.0.0.1:11434/api/ps)" && printf '%s' "$ps_json" | jq -e . >/dev/null 2>&1; then
+  if printf '%s' "$ps_json" | jq -e --arg requested "$model" --arg name "$model_name" --arg digest "$model_digest" \
+    '.models[]? | select((.name == $requested or .model == $requested or .name == $name or .model == $name or ($digest != "" and .digest == $digest)) and (.size_vram | type == "number") and .size_vram > 0)' >/dev/null; then
+    printf 'Info: smoke-tested model %s is using GPU VRAM\n' "$model" >&2
+  else
+    printf 'Info: smoke-tested model %s is running without detected GPU VRAM; Ollama is ready\n' "$model" >&2
+  fi
+else
+  printf 'Warning: could not query /api/ps to classify acceleration; smoke inference succeeded and Ollama is ready\n' >&2
+fi
 REMOTE_OLLAMA
 }
 
@@ -961,6 +1268,10 @@ print_ollama_endpoint() {
 }
 
 ensure_ollama() {
+  local state
+  OLLAMA_READY="0"
+  save_state
+  resolve_gpu_capability
   if [ -z "$OLLAMA_CIDR" ] || { [ "$PORT_CIDR_EXPLICIT" -eq 1 ] && [ "$PORT_CIDR" != "$OLLAMA_CIDR" ]; }; then
     configure_ollama_cidr
   else
@@ -968,7 +1279,8 @@ ensure_ollama() {
     PORT_CIDR="$OLLAMA_CIDR"
   fi
   save_state
-  validate_port_security_group "$(instance_state)"
+  state="$(instance_state)" || return 1
+  validate_port_security_group "$state"
   ensure_ollama_remote
   ensure_ollama_ingress
   OLLAMA_READY="1"
@@ -986,13 +1298,30 @@ create_vm() {
   fi
   [ "$PORT_CIDR_EXPLICIT" -eq 0 ] || [ "$OLLAMA_MODE" = "1" ] || [ "$MODEL_EXPLICIT" -eq 1 ] || die "create --cidr requires --model or a VM already in Ollama mode"
   ensure_auth
-  local live_account
+  apply_requested_availability_zone
+  local live_account existing_state=""
   live_account="$(aws_text sts get-caller-identity --query Account)"
   [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "$live_account" ] || die "state belongs to AWS account $ACCOUNT_ID, but current credentials use $live_account"
   ACCOUNT_ID="$live_account"
+  if [ -z "$INSTANCE_ID" ] && [ -n "$INSTANCE_TOKEN" ]; then reconcile_instance_token; fi
+  if [ -z "$INSTANCE_ID" ] && [ -n "$INSTANCE_TOKEN" ] && [ "$AMI_BINDINGS_PRESENT" -eq 0 ]; then bind_legacy_launch_state; fi
+  if [ -z "$INSTANCE_ID" ] && [ -n "$INSTANCE_TOKEN" ] && [ "$MODEL_EXPLICIT" -eq 1 ] && [ "$OLLAMA_MODE" = "0" ]; then
+    die "cannot change an unresolved legacy launch to Ollama mode; rerun without --model until token $INSTANCE_TOKEN is reconciled"
+  fi
+  if [ -n "$INSTANCE_ID" ]; then
+    existing_state="$(instance_state)" || return 1
+    sync_live_instance_type "$existing_state"
+    case "$existing_state" in
+      terminated|not-found|None|'')
+        AMI_ID=""
+        AMI_INSTANCE_TYPE=""
+        AMI_GPU_CLASS=""
+        AMI_INSTANCE_TOKEN=""
+        INSTANCE_TOKEN=""
+        ;;
+    esac
+  fi
   if [ "$INSTANCE_READY" = "1" ] && [ -n "$INSTANCE_ID" ]; then
-    local existing_state
-    existing_state="$(instance_state)"
     case "$existing_state" in
       terminated|not-found|None|'') ;;
       *)
@@ -1022,7 +1351,7 @@ create_vm() {
   if [ "$MODEL_EXPLICIT" -eq 1 ] && [ "$OLLAMA_MODE" = "0" ]; then
     if [ -n "$INSTANCE_ID" ]; then
       local upgrade_state
-      upgrade_state="$(instance_state)"
+      upgrade_state="$(instance_state)" || return 1
       case "$upgrade_state" in terminated|not-found|None|'') ;; *) die "VM '$NAME' has a partial plain instance $INSTANCE_ID ($upgrade_state); terminate it before recreating with Ollama" ;; esac
     fi
     OLLAMA_MODE="1"
@@ -1039,6 +1368,7 @@ create_vm() {
   verify_public_route
   info "Resolving AMI and instance type"
   resolve_instance_type
+  resolve_gpu_capability
   verify_instance_offering
   resolve_ami
   save_state
@@ -1056,15 +1386,84 @@ create_vm() {
 }
 
 instance_state() {
-  aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name' 2>/dev/null || printf 'not-found\n'
+  local result
+  if result="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name' 2>&1)"; then
+    case "$result" in
+      pending|running|shutting-down|terminated|stopping|stopped) printf '%s\n' "$result" ;;
+      *) printf 'Error: AWS returned an invalid state for instance %s; retry and inspect describe-instances if the error persists\n' "$INSTANCE_ID" >&2; return 1 ;;
+    esac
+  else
+    case "$result" in
+      'An error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation:'*) printf 'not-found\n' ;;
+      *) printf 'Error: cannot inspect instance %s; check AWS connectivity, authentication, and ec2:DescribeInstances permission, then retry\n' "$INSTANCE_ID" >&2; return 1 ;;
+    esac
+  fi
+}
+
+reconcile_instance_token() {
+  local result count recovered_id recovered_type recovered_ami
+  result="$(aws_text ec2 describe-instances --filters "Name=client-token,Values=$INSTANCE_TOKEN" --query 'Reservations[].Instances[].[InstanceId,InstanceType,ImageId]')" ||
+    die "cannot reconcile saved launch token $INSTANCE_TOKEN"
+  case "$result" in ''|None) return ;; esac
+  count="$(printf '%s\n' "$result" | awk 'NF { count++ } END { print count + 0 }')"
+  [ "$count" -eq 1 ] || die "saved launch token $INSTANCE_TOKEN matched $count instances; refusing ambiguous recovery"
+  read -r recovered_id recovered_type recovered_ami <<< "$result"
+  case "$recovered_id" in i-*) ;; *) die "saved launch token returned an invalid instance ID: $recovered_id" ;; esac
+  [ -n "$recovered_type" ] && [ "$recovered_type" != "None" ] || die "saved launch token returned no instance type"
+  case "$recovered_ami" in ami-*) ;; *) die "saved launch token returned an invalid AMI ID: $recovered_ami" ;; esac
+  INSTANCE_ID="$recovered_id"
+  AMI_ID="$recovered_ami"
+  AMI_INSTANCE_TYPE="$recovered_type"
+  AMI_GPU_CLASS=""
+  AMI_INSTANCE_TOKEN="$INSTANCE_TOKEN"
+  AMI_BINDINGS_PRESENT=1
+  save_state
+  info "Recovered instance $INSTANCE_ID from saved launch token"
+}
+
+bind_legacy_launch_state() {
+  local gpu_class
+  [ -n "$AMI_ID" ] && [ "$AMI_ID" != "None" ] || die "legacy launch token $INSTANCE_TOKEN has no saved AMI; refusing an unsafe retry"
+  [ -n "$SAVED_INSTANCE_TYPE" ] || die "legacy launch token $INSTANCE_TOKEN has no saved instance type; refusing an unsafe retry"
+  [ "$INSTANCE_TYPE" = "$SAVED_INSTANCE_TYPE" ] ||
+    die "legacy launch token $INSTANCE_TOKEN is tied to instance type $SAVED_INSTANCE_TYPE, not requested $INSTANCE_TYPE"
+  resolve_gpu_capability
+  if [ "$NVIDIA_GPU_PREFERRED" = "1" ]; then gpu_class="nvidia"; else gpu_class="generic"; fi
+  AMI_INSTANCE_TYPE="$SAVED_INSTANCE_TYPE"
+  AMI_GPU_CLASS="$gpu_class"
+  AMI_INSTANCE_TOKEN="$INSTANCE_TOKEN"
+  AMI_BINDINGS_PRESENT=1
+  save_state
+  warn "Bound legacy AMI $AMI_ID to unresolved launch token $INSTANCE_TOKEN for an idempotent retry"
+}
+
+sync_live_instance_type() {
+  local state="$1" live_type saved_type="$INSTANCE_TYPE"
+  case "$state" in terminated|shutting-down|not-found|None|'') return ;; esac
+  live_type="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].InstanceType')" ||
+    die "cannot inspect the live instance type for $INSTANCE_ID"
+  [ -n "$live_type" ] && [ "$live_type" != "None" ] || die "cannot determine the live instance type for $INSTANCE_ID"
+  if [ "$INSTANCE_TYPE_EXPLICIT" -eq 1 ] && [ "$saved_type" != "$live_type" ]; then
+    die "instance $INSTANCE_ID is $live_type, not requested instance type $saved_type"
+  fi
+  [ "$saved_type" != "$live_type" ] || return
+  warn "Saved instance type ${saved_type:-unknown} does not match live instance $INSTANCE_ID; using $live_type"
+  INSTANCE_TYPE="$live_type"
+  NVIDIA_GPU_PREFERRED=""
+  GPU_CAPABILITY_INSTANCE_TYPE=""
+  save_state
 }
 
 prepare_existing() {
   load_state
   ensure_auth
-  local live_account
+  local live_account state
   live_account="$(aws_text sts get-caller-identity --query Account)"
   [ "$live_account" = "$ACCOUNT_ID" ] || die "state belongs to AWS account $ACCOUNT_ID, but current credentials use $live_account"
+  if [ -n "$INSTANCE_ID" ]; then
+    state="$(instance_state)" || return 1
+    sync_live_instance_type "$state"
+  fi
 }
 
 validate_port_security_group() {
@@ -1116,7 +1515,7 @@ revoke_owned_port_rules() {
 expose_port() {
   prepare_existing
   local state rules owned_desired any_desired stale description host
-  state="$(instance_state)"
+  state="$(instance_state)" || return 1
   case "$state" in
     running|stopped) ;;
     *) die "instance is $state; expose-port requires a running or stopped VM" ;;
@@ -1158,7 +1557,7 @@ expose_port() {
 close_port() {
   prepare_existing
   local state rules ids
-  state="$(instance_state)"
+  state="$(instance_state)" || return 1
   validate_port_security_group "$state"
   rules="$(port_rules)" || die "cannot inspect TCP port $PORT rules in $SG_ID"
   ids="$(owned_port_rule_ids "$rules")"
@@ -1173,7 +1572,7 @@ close_port() {
 status_vm() {
   prepare_existing
   local state volume_state
-  state="$(instance_state)"
+  state="$(instance_state)" || return 1
   volume_state="$(aws_text ec2 describe-volumes --volume-ids "$VOLUME_ID" --query 'Volumes[0].State' 2>/dev/null || printf 'not-found')"
   if [ "$state" = "running" ]; then refresh_public_ip; else PUBLIC_IP=""; PUBLIC_DNS=""; fi
   printf 'Name:              %s\nInstance:          %s (%s)\nInstance type:     %s\nPersistent volume: %s (%s, %s GiB)\nLocation:          %s / %s\nPublic IP:         %s\nPublic DNS:        %s\n' \
@@ -1184,7 +1583,7 @@ status_vm() {
 start_vm() {
   prepare_existing
   local state
-  state="$(instance_state)"
+  state="$(instance_state)" || return 1
   case "$state" in
     running) info "$INSTANCE_ID is already running" ;;
     stopped) aws_text ec2 start-instances --instance-ids "$INSTANCE_ID" --query 'StartingInstances[0].CurrentState.Name' >/dev/null; "${AWS[@]}" ec2 wait instance-running --instance-ids "$INSTANCE_ID" ;;
@@ -1199,7 +1598,7 @@ start_vm() {
 stop_vm() {
   prepare_existing
   local state
-  state="$(instance_state)"
+  state="$(instance_state)" || return 1
   case "$state" in
     stopped) info "$INSTANCE_ID is already stopped" ;;
     running) aws_text ec2 stop-instances --instance-ids "$INSTANCE_ID" --query 'StoppingInstances[0].CurrentState.Name' >/dev/null; "${AWS[@]}" ec2 wait instance-stopped --instance-ids "$INSTANCE_ID" ;;
@@ -1215,7 +1614,7 @@ stop_vm() {
 restart_vm() {
   prepare_existing
   local state
-  state="$(instance_state)"
+  state="$(instance_state)" || return 1
   [ "$state" = "running" ] || die "instance is $state; use start instead"
   aws_text ec2 reboot-instances --instance-ids "$INSTANCE_ID" >/dev/null
   info "Restart requested for $INSTANCE_ID"
@@ -1325,7 +1724,7 @@ prepare_ssh_known_hosts() {
 prepare_ssh_endpoint() {
   prepare_existing
   local state
-  state="$(instance_state)"
+  state="$(instance_state)" || return 1
   [ "$state" = "running" ] || die "instance is $state; run '$0 start $NAME' first"
   refresh_public_ip
   [ -n "$PUBLIC_IP" ] || die "instance has no public IPv4 address; check subnet routing or use AWS Systems Manager"
@@ -2291,7 +2690,7 @@ confirm() {
 terminate_vm() {
   prepare_existing
   local state
-  state="$(instance_state)"
+  state="$(instance_state)" || return 1
   case "$state" in terminated|not-found|None) info "instance is already $state"; return ;; esac
   local persistent
   aws_text ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" --block-device-mappings "[{\"DeviceName\":\"$DEVICE_NAME\",\"Ebs\":{\"DeleteOnTermination\":false}}]" >/dev/null
@@ -2304,6 +2703,11 @@ terminate_vm() {
   PUBLIC_DNS=""
   INSTANCE_READY="0"
   OLLAMA_READY="0"
+  AMI_ID=""
+  AMI_INSTANCE_TYPE=""
+  AMI_GPU_CLASS=""
+  AMI_INSTANCE_TOKEN=""
+  INSTANCE_TOKEN=""
   save_state
   info "Instance terminated. Persistent volume retained: $VOLUME_ID"
   printf 'Recreate in %s with: %q create %q\n' "$AZ" "$0" "$NAME"
@@ -2324,6 +2728,8 @@ destroy_storage() {
   info "Deleted persistent volume $VOLUME_ID"
   VOLUME_ID=""
   VOLUME_TOKEN=""
+  SUBNET_ID=""
+  AZ=""
   save_state
   print_commands
 }
