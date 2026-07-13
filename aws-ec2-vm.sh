@@ -61,6 +61,7 @@ SSH_CONTROL_COMMAND="${AWS_VM_SSH_CONTROL_COMMAND:-}"
 SSH_REMOTE_COMMAND=()
 SSH_KNOWN_HOSTS=""
 SSH_ARGS=()
+CLEAN_INSTANCE_ID=""
 MOUNT_DIR=""
 MOUNT_DIR_EXPLICIT=0
 INSTALL_DEPS=0
@@ -115,6 +116,7 @@ USAGE
   aws-ec2-vm.sh setup [--profile PROFILE] [--region REGION]
   aws-ec2-vm.sh create [NAME] [OPTIONS]
   aws-ec2-vm.sh {status|ssh|start|restart|stop|terminate} [NAME] [OPTIONS]
+  aws-ec2-vm.sh clean [NAME] [--yes] [OPTIONS]
   aws-ec2-vm.sh {init-storage|prepare} [NAME] [OPTIONS]
   aws-ec2-vm.sh mount [NAME] [--mount-dir PATH] [--install-deps] [OPTIONS]
   aws-ec2-vm.sh unmount [NAME] [--mount-dir PATH] [--force]
@@ -177,6 +179,7 @@ EXAMPLES
   ./aws-ec2-vm.sh terminate mlbox       # keeps mlbox's data EBS volume
   ./aws-ec2-vm.sh create mlbox          # new VM, same persistent volume
   ./aws-ec2-vm.sh destroy-storage mlbox # permanently deletes that volume
+  ./aws-ec2-vm.sh clean mlbox --yes     # permanently removes the VM and all managed resources
 
 STORAGE AND COST
   The AMI-sized root disk is disposable (Ollama mode uses at least 30 GiB). A
@@ -215,7 +218,7 @@ parse_args() {
   shift
   case "$COMMAND" in
     -h|--help|help) COMMAND="help" ;;
-    setup|create|status|ssh|start|restart|stop|terminate|init-storage|prepare|mount|unmount|expose-port|close-port|destroy-storage|version) ;;
+    setup|create|status|ssh|start|restart|stop|terminate|clean|init-storage|prepare|mount|unmount|expose-port|close-port|destroy-storage|version) ;;
     *) die "unknown command: $COMMAND (run --help)" ;;
   esac
 
@@ -362,7 +365,7 @@ save_state() {
   local tmp="$STATE_FILE.tmp.$$" key value
   umask 077
   : > "$tmp"
-  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID AMI_INSTANCE_TYPE AMI_GPU_CLASS AMI_INSTANCE_TOKEN INSTANCE_TYPE VCPUS MEMORY_GIB DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_MODE OLLAMA_CIDR OLLAMA_READY; do
+  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID AMI_INSTANCE_TYPE AMI_GPU_CLASS AMI_INSTANCE_TOKEN INSTANCE_TYPE VCPUS MEMORY_GIB DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_MODE OLLAMA_CIDR OLLAMA_READY CLEAN_INSTANCE_ID; do
     eval "value=\${$key}"
     case "$value" in *$'\n'*|*$'\r'*) rm -f "$tmp"; die "state value contains a newline" ;; esac
     printf '%s=%s\n' "$key" "$value" >> "$tmp"
@@ -411,6 +414,7 @@ load_state() {
       OLLAMA_MODE) OLLAMA_MODE="$value"; ollama_mode_present=1 ;;
       OLLAMA_CIDR) OLLAMA_CIDR="$value" ;;
       OLLAMA_READY) OLLAMA_READY="$value" ;;
+      CLEAN_INSTANCE_ID) CLEAN_INSTANCE_ID="$value" ;;
       '') ;;
       *) die "unknown field in state file: $key" ;;
     esac
@@ -439,6 +443,8 @@ load_state() {
   [ -z "$OLLAMA_CIDR" ] || valid_cidr "$OLLAMA_CIDR" || die "invalid Ollama CIDR in state"
   case "$OLLAMA_READY" in 0|1) ;; *) die "invalid Ollama readiness marker in state" ;; esac
   case "$OLLAMA_MODE" in 0|1) ;; *) die "invalid Ollama mode marker in state" ;; esac
+  case "$CLEAN_INSTANCE_ID" in ''|i-[a-zA-Z0-9]*) ;; *) die "invalid cleanup instance ID in state" ;; esac
+  [ -z "$CLEAN_INSTANCE_ID" ] || [ "$COMMAND" = "clean" ] || die "cleanup for '$NAME' is incomplete; rerun clean"
 }
 
 release_mount_path_lock() {
@@ -2687,6 +2693,306 @@ confirm() {
   [ "$answer" = "$NAME" ] || die "cancelled"
 }
 
+CLEAN_INSTANCE_PRESENT=0
+CLEAN_INSTANCE_STATE=""
+CLEAN_VOLUME_PRESENT=0
+CLEAN_SG_PRESENT=0
+CLEAN_KEY_PRESENT=0
+
+clean_resource_not_found() {
+  case "$1:$2" in
+    instance:*InvalidInstanceID.NotFound*|volume:*InvalidVolume.NotFound*|security-group:*InvalidGroup.NotFound*|key-pair:*InvalidKeyPair.NotFound*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+clean_verify_state_file() {
+  [ ! -L "$STATE_FILE" ] && [ -f "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+    die "clean requires an owned, non-symlink regular state file: $STATE_FILE"
+  local permissions links
+  read -r permissions links <<< "$(stat -f '%Lp %l' "$STATE_FILE" 2>/dev/null || stat -c '%a %h' "$STATE_FILE" 2>/dev/null || true)"
+  [ "$permissions" = "600" ] && [ "$links" = "1" ] ||
+    die "clean requires state mode 0600 with exactly one hard link: $STATE_FILE"
+}
+
+clean_refuse_mount_config() {
+  local config="$STATE_DIR/mounts/$NAME.conf" permissions mount_dir="" key value
+  [ ! -e "$config" ] && [ ! -L "$config" ] && return 0
+  [ ! -L "$config" ] && [ -f "$config" ] && [ -O "$config" ] || die "managed mount config is insecure: $config"
+  permissions="$(stat -f '%Lp' "$config" 2>/dev/null || stat -c '%a' "$config" 2>/dev/null || true)"
+  [ "$permissions" = "600" ] || die "managed mount config must have mode 0600: $config"
+  while IFS='=' read -r key value; do
+    case "$key" in MOUNT_DIR) mount_dir="$value" ;; esac
+  done < "$config"
+  die "managed mount metadata exists for '$NAME'; run '$0 unmount $NAME${mount_dir:+ --mount-dir $mount_dir}' first (use --force only for its unresponsive managed mount)"
+}
+
+CLEAN_TRUSTED_HOME=""
+
+clean_resolve_trusted_home() {
+  local uid username home_record
+  if [ "$(uname -s)" != "Darwin" ]; then
+    case "$HOME" in /*) ;; *) die "HOME must be absolute before clean" ;; esac
+    [ ! -L "$HOME" ] && [ -d "$HOME" ] && [ -O "$HOME" ] || die "HOME is insecure before clean: $HOME"
+    CLEAN_TRUSTED_HOME="$HOME"
+    return
+  fi
+  uid="$(id -u)"
+  case "$uid" in ''|*[!0-9]*) die "could not determine numeric local UID before clean" ;; esac
+  [ -x /usr/bin/dscl ] && [ -x /usr/bin/id ] || die "clean requires macOS directory services to resolve durable mount claims"
+  username="$(/usr/bin/id -un)" || die "could not resolve the local account name before clean"
+  home_record="$(/usr/bin/dscl . -read "/Users/$username" NFSHomeDirectory 2>/dev/null)" ||
+    die "could not resolve the trusted home directory before clean"
+  case "$home_record" in "NFSHomeDirectory: "*) ;; *) die "directory services returned an invalid home record before clean" ;; esac
+  CLEAN_TRUSTED_HOME="${home_record#NFSHomeDirectory: }"
+  case "$CLEAN_TRUSTED_HOME" in /*) ;; *) die "directory services returned a non-absolute home path before clean" ;; esac
+  case "$CLEAN_TRUSTED_HOME" in *[[:cntrl:]]*) die "directory services returned a home path with control characters before clean" ;; esac
+  [ ! -L "$CLEAN_TRUSTED_HOME" ] && [ -d "$CLEAN_TRUSTED_HOME" ] && [ -O "$CLEAN_TRUSTED_HOME" ] ||
+    die "trusted home path is insecure before clean: $CLEAN_TRUSTED_HOME"
+  [ "$(stat -f '%u' "$CLEAN_TRUSTED_HOME" 2>/dev/null || true)" = "$uid" ] ||
+    die "trusted home path is not owned by UID $uid: $CLEAN_TRUSTED_HOME"
+}
+
+clean_refuse_mount_claim_root() {
+  local root="$1" claim permissions links key value claim_name mount_dir
+  local name_count mount_count config_count
+  [ ! -e "$root" ] && [ ! -L "$root" ] && return 0
+  [ ! -L "$root" ] && [ -d "$root" ] && [ -O "$root" ] || die "persistent mount-claim directory is insecure: $root"
+  permissions="$(stat -f '%Lp' "$root" 2>/dev/null || stat -c '%a' "$root" 2>/dev/null || true)"
+  [ "$permissions" = "700" ] || die "persistent mount-claim directory must be mode 0700: $root"
+  shopt -s nullglob
+  for claim in "$root"/*.claim; do
+    [ ! -L "$claim" ] && [ -f "$claim" ] && [ -O "$claim" ] || die "persistent mount claim is insecure: $claim"
+    read -r permissions links <<< "$(stat -f '%Lp %l' "$claim" 2>/dev/null || stat -c '%a %h' "$claim" 2>/dev/null || true)"
+    [ "$permissions" = "600" ] && [ "$links" = "1" ] || die "persistent mount claim must be private and single-link: $claim"
+    claim_name=""; mount_dir=""; name_count=0; mount_count=0; config_count=0
+    while IFS='=' read -r key value; do
+      case "$key" in
+        NAME) claim_name="$value"; name_count=$((name_count + 1)) ;;
+        MOUNT_DIR) mount_dir="$value"; mount_count=$((mount_count + 1)) ;;
+        MOUNT_CONFIG) config_count=$((config_count + 1)) ;;
+        *) die "persistent mount claim has unknown metadata: $claim" ;;
+      esac
+    done < "$claim"
+    [ "$name_count" -eq 1 ] && [ "$mount_count" -eq 1 ] && [ "$config_count" -eq 1 ] && [ -n "$claim_name" ] && [ -n "$mount_dir" ] ||
+      die "persistent mount claim has duplicate or missing metadata: $claim"
+    [ "$claim_name" != "$NAME" ] ||
+      die "persistent mount claim exists for '$NAME'; run '$0 unmount $NAME${mount_dir:+ --mount-dir $mount_dir}' first (use --force only for its unresponsive managed mount)"
+  done
+  shopt -u nullglob
+}
+
+clean_refuse_mount_claims() {
+  clean_resolve_trusted_home
+  clean_refuse_mount_claim_root "$CLEAN_TRUSTED_HOME/.aws-ec2-vm-mount-claims"
+  if [ "$HOME" != "$CLEAN_TRUSTED_HOME" ]; then
+    clean_refuse_mount_claim_root "$HOME/.aws-ec2-vm-mount-claims"
+  fi
+}
+
+clean_refuse_active_mount() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  local line source instance_part remainder mount_dir mount_output
+  [ -x /sbin/mount ] || die "trusted /sbin/mount is unavailable; cannot inspect active macFUSE mounts before clean"
+  mount_output="$(/sbin/mount)" || die "could not inspect active mounts before clean"
+  while IFS= read -r line; do
+    source="${line%% on *}"
+    case "$source" in "aws-ec2-vm-$NAME-i-"*":/data") ;; *) continue ;; esac
+    instance_part="${source#"aws-ec2-vm-$NAME-i-"}"
+    instance_part="${instance_part%:/data}"
+    case "$instance_part" in ''|*[!a-zA-Z0-9]*) continue ;; esac
+    remainder="${line#"$source on "}"
+    case "$remainder" in *' (macfuse)'|*' (macfuse,'*) ;; *) continue ;; esac
+    mount_dir="${remainder% (macfuse*}"
+    die "active managed mount exists for '$NAME'; run '$0 unmount $NAME --mount-dir $mount_dir' first (use --force only if this exact managed mount is unresponsive)"
+  done <<< "$mount_output"
+}
+
+clean_preflight_instance() {
+  CLEAN_INSTANCE_PRESENT=0
+  CLEAN_INSTANCE_STATE=""
+  [ -n "$INSTANCE_ID" ] || return 0
+  CLEAN_INSTANCE_STATE="$(instance_state)" || return 1
+  case "$CLEAN_INSTANCE_STATE" in not-found|None|'') return 0 ;; esac
+  local result resource_name managed_by
+  if ! result="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].[Tags[?Key=='Name']|[0].Value,Tags[?Key=='ManagedBy']|[0].Value]" 2>&1)"; then
+    if clean_resource_not_found instance "$result"; then CLEAN_INSTANCE_STATE="not-found"; return 0; fi
+    die "cannot verify ownership of instance $INSTANCE_ID: $result"
+  fi
+  read -r resource_name managed_by <<< "$result"
+  [ "$resource_name" = "$NAME" ] && [ "$managed_by" = "aws-ec2-vm" ] ||
+    die "instance $INSTANCE_ID is not owned by aws-ec2-vm name '$NAME'; refusing clean"
+  [ "$CLEAN_INSTANCE_STATE" = "terminated" ] || CLEAN_INSTANCE_PRESENT=1
+}
+
+clean_preflight_volume() {
+  CLEAN_VOLUME_PRESENT=0
+  [ -n "$VOLUME_ID" ] || return 0
+  local result resource_name managed_by attachment
+  if ! result="$(aws_text ec2 describe-volumes --volume-ids "$VOLUME_ID" --query "Volumes[0].[Tags[?Key=='Name']|[0].Value,Tags[?Key=='ManagedBy']|[0].Value]" 2>&1)"; then
+    clean_resource_not_found volume "$result" && return 0
+    die "cannot verify ownership of volume $VOLUME_ID: $result"
+  fi
+  case "$result" in ''|None) return 0 ;; esac
+  read -r resource_name managed_by <<< "$result"
+  [ "$resource_name" = "$NAME-data" ] && [ "$managed_by" = "aws-ec2-vm" ] ||
+    die "volume $VOLUME_ID is not owned by aws-ec2-vm name '$NAME-data'; refusing clean"
+  if ! attachment="$(aws_text ec2 describe-volumes --volume-ids "$VOLUME_ID" --query 'Volumes[0].Attachments[0].InstanceId' 2>&1)"; then
+    clean_resource_not_found volume "$attachment" && return 0
+    die "cannot inspect attachment for volume $VOLUME_ID: $attachment"
+  fi
+  case "$attachment" in
+    ''|None) ;;
+    "$INSTANCE_ID"|"$CLEAN_INSTANCE_ID") ;;
+    *) die "volume $VOLUME_ID is attached to $attachment, not this VM; refusing clean" ;;
+  esac
+  CLEAN_VOLUME_PRESENT=1
+}
+
+clean_preflight_security_group() {
+  CLEAN_SG_PRESENT=0
+  [ -n "$SG_ID" ] || return 0
+  local result group_name group_vpc resource_name managed_by
+  if ! result="$(aws_text ec2 describe-security-groups --group-ids "$SG_ID" --query "SecurityGroups[0].[GroupName,VpcId,Tags[?Key=='Name']|[0].Value,Tags[?Key=='ManagedBy']|[0].Value]" 2>&1)"; then
+    clean_resource_not_found security-group "$result" && return 0
+    die "cannot verify ownership of security group $SG_ID: $result"
+  fi
+  case "$result" in ''|None) return 0 ;; esac
+  read -r group_name group_vpc resource_name managed_by <<< "$result"
+  [ -n "$VPC_ID" ] && [ "$group_name" = "aws-vm-$NAME" ] && [ "$group_vpc" = "$VPC_ID" ] &&
+    [ "$resource_name" = "aws-vm-$NAME" ] && [ "$managed_by" = "aws-ec2-vm" ] ||
+    die "security group $SG_ID is not the owned aws-vm-$NAME group in saved VPC $VPC_ID; refusing clean"
+  CLEAN_SG_PRESENT=1
+}
+
+clean_preflight_key() {
+  CLEAN_KEY_PRESENT=0
+  if [ -z "$KEY_NAME" ] && [ -z "$KEY_PATH" ]; then return 0; fi
+  [ "$KEY_NAME" = "aws-vm-$NAME" ] || die "saved key name is not the managed aws-vm-$NAME key; refusing clean"
+  [ "$KEY_PATH" = "$STATE_DIR/keys/$NAME" ] || die "saved key path is not the exact managed key path; refusing clean"
+  local result
+  if ! result="$(aws_text ec2 describe-key-pairs --key-names "$KEY_NAME" --query 'KeyPairs[0].KeyName' 2>&1)"; then
+    clean_resource_not_found key-pair "$result" && return 0
+    die "cannot verify key pair $KEY_NAME: $result"
+  fi
+  case "$result" in ''|None) return 0 ;; esac
+  [ "$result" = "$KEY_NAME" ] || die "AWS returned an unexpected key pair for $KEY_NAME; refusing clean"
+  CLEAN_KEY_PRESENT=1
+}
+
+clean_delete_security_group() {
+  local attempt=1 result
+  while [ "$attempt" -le 6 ]; do
+    if result="$(aws_text ec2 delete-security-group --group-id "$SG_ID" 2>&1)"; then return 0; fi
+    clean_resource_not_found security-group "$result" && return 0
+    case "$result" in
+      *DependencyViolation*)
+        [ "$attempt" -lt 6 ] || die "could not delete security group $SG_ID after waiting for dependencies: $result"
+        sleep 2
+        ;;
+      *) die "could not delete security group $SG_ID: $result" ;;
+    esac
+    attempt=$((attempt + 1))
+  done
+}
+
+remove_clean_file() {
+  local path="$1"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ ! -d "$path" ] || die "managed cleanup artifact is unexpectedly a directory: $path"
+    rm -f -- "$path" || die "could not remove managed cleanup artifact: $path"
+  fi
+}
+
+clean_vm() {
+  clean_verify_state_file
+  load_state
+  case "$PROFILE" in ''|*[!a-zA-Z0-9_+=,.@-]*) die "invalid saved profile for clean" ;; esac
+  case "$REGION" in ''|*[!a-z0-9-]*) die "invalid saved region for clean" ;; esac
+  [[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]] || die "invalid saved AWS account ID for clean"
+  clean_refuse_mount_config
+  clean_refuse_mount_claims
+  clean_refuse_active_mount
+  ensure_auth
+  local live_account result original_instance_id
+  live_account="$(aws_text sts get-caller-identity --query Account)"
+  [ "$live_account" = "$ACCOUNT_ID" ] || die "state belongs to AWS account $ACCOUNT_ID, but current credentials use $live_account"
+  if [ -z "$INSTANCE_ID" ] && [ -n "$INSTANCE_TOKEN" ] && [ -z "$CLEAN_INSTANCE_ID" ]; then reconcile_instance_token; fi
+  clean_preflight_instance
+  clean_preflight_volume
+  clean_preflight_security_group
+  clean_preflight_key
+  confirm "PERMANENTLY delete all managed AWS and local resources for '$NAME'? This cannot be undone."
+
+  if [ -z "$CLEAN_INSTANCE_ID" ]; then CLEAN_INSTANCE_ID="$INSTANCE_ID"; save_state; fi
+  original_instance_id="$CLEAN_INSTANCE_ID"
+  if [ "$CLEAN_INSTANCE_PRESENT" -eq 1 ]; then
+    case "$CLEAN_INSTANCE_STATE" in
+      shutting-down) ;;
+      *)
+        if ! result="$(aws_text ec2 terminate-instances --instance-ids "$INSTANCE_ID" --query 'TerminatingInstances[0].CurrentState.Name' 2>&1)"; then
+          if clean_resource_not_found instance "$result"; then CLEAN_INSTANCE_PRESENT=0; else die "could not terminate instance $INSTANCE_ID: $result"; fi
+        fi
+        ;;
+    esac
+    if [ "$CLEAN_INSTANCE_PRESENT" -eq 1 ]; then
+      if ! result="$("${AWS[@]}" ec2 wait instance-terminated --instance-ids "$INSTANCE_ID" 2>&1)"; then
+        clean_resource_not_found instance "$result" || die "could not wait for instance $INSTANCE_ID to terminate: $result"
+      fi
+    fi
+  fi
+  INSTANCE_ID=""
+  INSTANCE_TOKEN=""
+  INSTANCE_READY="0"
+  PUBLIC_IP=""
+  PUBLIC_DNS=""
+  AMI_ID=""
+  AMI_INSTANCE_TYPE=""
+  AMI_GPU_CLASS=""
+  AMI_INSTANCE_TOKEN=""
+  OLLAMA_READY="0"
+  save_state
+
+  if [ "$CLEAN_VOLUME_PRESENT" -eq 1 ]; then
+    if ! result="$("${AWS[@]}" ec2 wait volume-available --volume-ids "$VOLUME_ID" 2>&1)"; then
+      if clean_resource_not_found volume "$result"; then CLEAN_VOLUME_PRESENT=0; else die "could not wait for volume $VOLUME_ID to become available: $result"; fi
+    fi
+    if [ "$CLEAN_VOLUME_PRESENT" -eq 1 ]; then
+      if ! result="$(aws_text ec2 delete-volume --volume-id "$VOLUME_ID" 2>&1)"; then
+        clean_resource_not_found volume "$result" || die "could not delete volume $VOLUME_ID: $result"
+      fi
+    fi
+  fi
+  VOLUME_ID=""
+  VOLUME_TOKEN=""
+  SUBNET_ID=""
+  AZ=""
+  save_state
+
+  if [ "$CLEAN_SG_PRESENT" -eq 1 ]; then clean_delete_security_group; fi
+  SG_ID=""
+  save_state
+
+  if [ "$CLEAN_KEY_PRESENT" -eq 1 ]; then
+    if ! result="$(aws_text ec2 delete-key-pair --key-name "$KEY_NAME" 2>&1)"; then
+      clean_resource_not_found key-pair "$result" || die "could not delete key pair $KEY_NAME: $result"
+    fi
+  fi
+  KEY_NAME=""
+  KEY_PATH=""
+  save_state
+
+  remove_clean_file "$STATE_DIR/keys/$NAME"
+  remove_clean_file "$STATE_DIR/keys/$NAME.pub"
+  if [ -n "$original_instance_id" ]; then
+    remove_clean_file "$STATE_DIR/known_hosts/$original_instance_id"
+    remove_clean_file "$STATE_DIR/sshfs/$NAME-$original_instance_id.conf"
+    remove_clean_file "$STATE_DIR/sshfs/$NAME-$original_instance_id.log"
+  fi
+  remove_clean_file "$STATE_FILE"
+  info "Removed all managed resources for name=$NAME"
+}
+
 terminate_vm() {
   prepare_existing
   local state
@@ -2755,6 +3061,7 @@ main() {
     restart) restart_vm ;;
     stop) stop_vm ;;
     terminate) terminate_vm ;;
+    clean) clean_vm ;;
     expose-port) expose_port ;;
     close-port) close_port ;;
     destroy-storage) destroy_storage ;;
