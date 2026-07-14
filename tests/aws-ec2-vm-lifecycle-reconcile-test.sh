@@ -623,6 +623,7 @@ case_create_live_instance_identity() (
   ensure_security_group() { pipeline_step ensure-sg; }
   ensure_volume() { pipeline_step ensure-volume; }
   create_instance() { pipeline_step "create-instance:id=${INSTANCE_ID}:token=${INSTANCE_TOKEN}"; }
+  initialize_storage() { pipeline_step initialize-storage; }
   ensure_managed_ingress() { pipeline_step ensure-ingress; }
   ensure_ollama() { pipeline_step ensure-ollama; }
   print_commands() { :; }
@@ -716,6 +717,7 @@ LIVE_SAVED_AMI_TOKEN=""
 run_case live-instance-primary-token-only case_create_live_instance_identity
 assert_success 'legacy partial live instance with only the matching primary token may resume'
 assert_log_contains 'primary-token-only legacy state reaches provisioning after validation' "$CASE_DIR/mutations" 'provision:discover-ssh'
+assert_log_order 'primary-token-only resume initializes storage after instance attachment' "$CASE_DIR/events" 'provision:create-instance' 'provision:initialize-storage'
 
 for transitional_state in stopping shutting-down; do
   LIVE_INSTANCE_STATE="$transitional_state"
@@ -799,6 +801,7 @@ LIVE_INSTANCE_ROW='i-live t3.small ami-test subnet-test us-east-1a aws-vm-test t
 run_case completed-ollama-live-exact case_create_live_instance_identity
 assert_success 'completed exact-owned live instance may resume Ollama provisioning'
 assert_log_contains 'exact completed Ollama resume reaches remote provisioning after validation' "$CASE_DIR/mutations" 'provision:ensure-ollama'
+assert_log_order 'completed Ollama resume initializes storage before remote provisioning' "$CASE_DIR/events" 'provision:initialize-storage' 'provision:ensure-ollama'
 
 case_full_create_partial_instance_replay() (
   init_state
@@ -820,6 +823,7 @@ case_full_create_partial_instance_replay() (
   resolve_ami() { :; }
   ensure_key() { :; }
   refresh_public_ip() { :; }
+  initialize_storage() { printf '%s\n' initialize-storage >> "$CASE_DIR/events"; }
   print_commands() { :; }
   print_disk_instructions() { :; }
   save_state() { :; }
@@ -861,6 +865,7 @@ case_full_create_partial_instance_replay() (
         ;;
       ec2:run-instances)
         printf '%s\n' "$args" >> "$CASE_DIR/mutations"
+        printf '%s\n' create-instance >> "$CASE_DIR/events"
         touch "$CASE_DIR/launched"
         printf '%s\n' i-saved
         ;;
@@ -881,6 +886,7 @@ assert_log_contains 'pre-replay SG inventory is scoped only to the saved managed
 assert_log_count 'full create issues exactly one same-token run request' 1 "$CASE_DIR/mutations" 'ec2 run-instances'
 assert_log_contains 'full create replays the exact persisted instance token' "$CASE_DIR/mutations" '--client-token token-test'
 assert_file_contains 'full create preserves the expected saved instance identity' "$CASE_DIR/resolved-instance" 'i-saved'
+assert_log_order 'full replay initializes storage after the instance and volume are attached' "$CASE_DIR/events" create-instance initialize-storage
 
 printf '1..%d\n' "$tests"
 [ "$failures" -eq 0 ] || { printf '%d test(s) failed\n' "$failures" >&2; exit 1; }

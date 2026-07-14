@@ -38,11 +38,10 @@ profile or region.
 # Configure AWS access.
 ./aws-ec2-vm.sh setup --profile dev --region us-east-1
 
-# Create a VM with a 100 GiB persistent data volume.
+# Create a VM with a 100 GiB persistent data volume, prepared at /data.
 ./aws-ec2-vm.sh create devbox --vcpus 4 --memory 8 --disk 100
 
-# Initialize a new data volume, then connect.
-./aws-ec2-vm.sh init-storage devbox
+# Connect after creation completes.
 ./aws-ec2-vm.sh ssh devbox
 
 # Inspect and control the instance.
@@ -52,10 +51,16 @@ profile or region.
 ./aws-ec2-vm.sh terminate devbox
 ```
 
-`init-storage` verifies the managed volume before formatting it and requires the
-exact interactive confirmation `FORMAT <volume-id>`; `--yes` cannot bypass this
-check. On an already initialized volume, use `prepare` to verify and mount it at
-`/data` without formatting it.
+During `create`, a verified blank managed volume is formatted automatically,
+mounted at `/data`, and prepared for use. A managed volume with one supported
+ext4 filesystem is reused, mounted, and prepared without reformatting. Creation
+refuses to format a volume with an unsupported filesystem or other nonblank
+signature.
+
+For manual recovery, `init-storage` verifies the managed volume before
+formatting it and requires the exact interactive confirmation `FORMAT
+<volume-id>`; `--yes` cannot bypass this check. Use `prepare` to verify and mount
+an already initialized volume at `/data` without formatting it.
 
 Other actions include:
 
@@ -82,6 +87,19 @@ Examples:
 # Provision Ollama and restrict its endpoint to the stated network.
 ./aws-ec2-vm.sh create mlbox --model gemma3:4b \
   --instance-type g6.xlarge --cidr 203.0.113.0/24
+```
+
+Models requested with `--model` are stored on the persistent EBS volume under
+`/data/ollama/models`. Before provisioning Ollama, `create` automatically
+initializes a verified blank volume or reuses a volume with one supported ext4
+filesystem, then mounts and prepares it at `/data`. It never reformats an
+initialized volume and refuses unsupported filesystems or other nonblank
+signatures instead of overwriting them.
+
+```sh
+# Inspect persistent-volume capacity and model storage usage.
+./aws-ec2-vm.sh ssh mlbox -- df -h /data
+./aws-ec2-vm.sh ssh mlbox -- sudo du -sh /data/ollama/models
 ```
 
 > [!CAUTION]

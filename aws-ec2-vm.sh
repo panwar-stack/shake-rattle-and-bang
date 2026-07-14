@@ -191,8 +191,8 @@ EXAMPLES
   ./aws-ec2-vm.sh status mlbox
   ./aws-ec2-vm.sh ssh mlbox
   ./aws-ec2-vm.sh ssh mlbox --forward-agent -- git status
-  ./aws-ec2-vm.sh init-storage mlbox # first use only; requires exact TTY confirmation
-  ./aws-ec2-vm.sh prepare mlbox      # safely mount and prepare persistent paths
+  ./aws-ec2-vm.sh init-storage mlbox # manual recovery; requires exact TTY confirmation
+  ./aws-ec2-vm.sh prepare mlbox      # safely remount and prepare persistent paths
   ./aws-ec2-vm.sh mount mlbox        # mount /data at ~/mnt/aws-ec2-vm/mlbox
   ./aws-ec2-vm.sh unmount mlbox
   ./aws-ec2-vm.sh stop mlbox
@@ -215,9 +215,11 @@ STORAGE AND COST
   for public IPv4 while allocated. Public IPv4 may change after stop/start. The
   script never deletes persistent storage as part of termination or failure.
 
-  The data disk is never formatted automatically. On first use, run
-  `init-storage`; it proves the EBS/NVMe identity and blank state, then requires
-  the exact TTY phrase it prints. `prepare` never formats storage.
+  During create, a verified blank managed data disk is formatted as ext4,
+  mounted at /data, and prepared automatically. Existing ext4 storage is reused
+  without formatting; unsupported filesystems and other signatures are refused.
+  `init-storage` remains available for manual recovery and requires its exact
+  TTY confirmation. `prepare` never formats storage.
 
 AUTHENTICATION
   Credentials are never accepted as flags or stored by this script. `setup`
@@ -1303,9 +1305,9 @@ print_disk_instructions() {
   cat <<'EOF'
 
 PERSISTENT STORAGE
-  First use only: run this script's `init-storage NAME` command. It formats only
-  after exact AWS attachment, Nitro serial, blank-device, and TTY confirmation
-  checks. Then run `prepare NAME`. On reused storage, run only `prepare NAME`.
+  The managed EBS volume is initialized when provably blank, mounted at /data,
+  and prepared during create. Existing ext4 storage is mounted without
+  reformatting. Unsupported filesystems and other signatures are refused.
   Never run mkfs manually or use init-storage to repair an existing filesystem.
 EOF
 }
@@ -1660,6 +1662,97 @@ if [ "$repair_archive" -eq 1 ]; then
 fi
 command -v ollama >/dev/null 2>&1 || { printf 'Error: Ollama archive did not install the ollama command\n' >&2; exit 1; }
 
+mountpoint -q /data || { printf 'Error: persistent storage is not mounted at /data\n' >&2; exit 1; }
+data_device="$(findmnt -n -o MAJ:MIN --target /data)"
+[ -n "$data_device" ] || { printf 'Error: could not identify the persistent /data mount\n' >&2; exit 1; }
+persisted_ollama_uid=""
+persisted_ollama_gid=""
+for path in /data/ollama /data/ollama/models; do
+  [ ! -L "$path" ] || { printf 'Error: persistent Ollama path is a symlink: %s\n' "$path" >&2; exit 1; }
+  if [ -e "$path" ]; then
+    [ "$(findmnt -n -o MAJ:MIN --target "$path")" = "$data_device" ] || {
+      printf 'Error: persistent Ollama path is on an unexpected nested mount: %s\n' "$path" >&2
+      exit 1
+    }
+    path_identity="$(stat -c '%u:%g:%a:%F' -- "$path")"
+    IFS=: read -r path_uid path_gid path_mode path_type <<< "$path_identity"
+    [[ "$path_uid" =~ ^[0-9]+$ ]] && [[ "$path_gid" =~ ^[0-9]+$ ]] && [ "$path_mode:$path_type" = "755:directory" ] || {
+      printf 'Error: existing persistent Ollama path must be a real mode-0755 directory: %s\n' "$path" >&2
+      exit 1
+    }
+    [ "$path_uid" -ne 0 ] && [ "$path_gid" -ne 0 ] || {
+      printf 'Error: existing persistent Ollama path must have non-root ownership; UID/GID 0 is refused: %s\n' "$path" >&2
+      exit 1
+    }
+    if [ -z "$persisted_ollama_uid" ]; then
+      persisted_ollama_uid="$path_uid"
+      persisted_ollama_gid="$path_gid"
+    elif [ "$path_uid:$path_gid" != "$persisted_ollama_uid:$persisted_ollama_gid" ]; then
+      printf 'Error: persistent Ollama directories must have the same consistent owner UID/GID\n' >&2
+      exit 1
+    fi
+  fi
+done
+
+if [ -n "$persisted_ollama_uid" ]; then
+  uid_claim="$(getent passwd "$persisted_ollama_uid" || true)"
+  if [ -n "$uid_claim" ] && { [ "$(printf '%s\n' "$uid_claim" | wc -l)" -ne 1 ] || [ "${uid_claim%%:*}" != "ollama" ]; }; then
+    printf 'Error: persisted Ollama UID collision: UID %s is used by an account other than ollama\n' "$persisted_ollama_uid" >&2
+    exit 1
+  fi
+  gid_claim="$(getent group "$persisted_ollama_gid" || true)"
+  if [ -n "$gid_claim" ] && { [ "$(printf '%s\n' "$gid_claim" | wc -l)" -ne 1 ] || [ "${gid_claim%%:*}" != "ollama" ]; }; then
+    printf 'Error: persisted Ollama GID collision: GID %s is used by a group other than ollama\n' "$persisted_ollama_gid" >&2
+    exit 1
+  fi
+  named_group="$(getent group ollama || true)"
+  if [ -n "$named_group" ]; then
+    [ "$(printf '%s\n' "$named_group" | wc -l)" -eq 1 ] && [ "$(printf '%s' "$named_group" | cut -d: -f3)" = "$persisted_ollama_gid" ] || {
+      printf 'Error: existing ollama group conflicts with persisted Ollama GID %s\n' "$persisted_ollama_gid" >&2
+      exit 1
+    }
+  else
+    groupadd --system --gid "$persisted_ollama_gid" ollama
+  fi
+  named_user="$(getent passwd ollama || true)"
+  if [ -n "$named_user" ]; then
+    [ "$(printf '%s\n' "$named_user" | wc -l)" -eq 1 ] &&
+      [ "$(printf '%s' "$named_user" | cut -d: -f3)" = "$persisted_ollama_uid" ] &&
+      [ "$(printf '%s' "$named_user" | cut -d: -f4)" = "$persisted_ollama_gid" ] || {
+        printf 'Error: existing ollama user conflicts with persisted Ollama UID/GID %s:%s\n' "$persisted_ollama_uid" "$persisted_ollama_gid" >&2
+        exit 1
+      }
+  else
+    useradd --system --uid "$persisted_ollama_uid" --gid ollama --home-dir /usr/share/ollama --create-home --shell /sbin/nologin ollama
+  fi
+  [ "$(id -u ollama)" = "$persisted_ollama_uid" ] || { printf 'Error: assigned ollama UID does not match persisted_ollama_uid %s\n' "$persisted_ollama_uid" >&2; exit 1; }
+  [ "$(id -g ollama)" = "$persisted_ollama_gid" ] || { printf 'Error: assigned ollama GID does not match persisted_ollama_gid %s\n' "$persisted_ollama_gid" >&2; exit 1; }
+else
+  getent group ollama >/dev/null 2>&1 || groupadd --system ollama
+  id -u ollama >/dev/null 2>&1 || useradd --system --gid ollama --home-dir /usr/share/ollama --create-home --shell /sbin/nologin ollama
+fi
+ollama_uid="$(id -u ollama)"
+ollama_gid="$(id -g ollama)"
+[[ "$ollama_uid" =~ ^[0-9]+$ ]] && [[ "$ollama_gid" =~ ^[0-9]+$ ]] && [ "$ollama_uid" -gt 0 ] && [ "$ollama_gid" -gt 0 ] || {
+  printf 'Error: ollama account must have non-root numeric UID/GID\n' >&2
+  exit 1
+}
+install -d -o ollama -g ollama -m 0755 /usr/share/ollama
+mountpoint -q /data && [ "$(findmnt -n -o MAJ:MIN --target /data)" = "$data_device" ] || {
+  printf 'Error: persistent /data mount changed during Ollama account setup\n' >&2
+  exit 1
+}
+install -d -o ollama -g ollama -m 0755 /data/ollama
+install -d -o ollama -g ollama -m 0755 /data/ollama/models
+for path in /data/ollama /data/ollama/models; do
+  [ ! -L "$path" ] && [ "$(findmnt -n -o MAJ:MIN --target "$path")" = "$data_device" ] &&
+    [ "$(stat -c '%u:%g:%a:%F' -- "$path")" = "$ollama_uid:$ollama_gid:755:directory" ] || {
+    printf 'Error: persistent Ollama path verification failed: %s\n' "$path" >&2
+    exit 1
+  }
+done
+export OLLAMA_MODELS=/data/ollama/models
+
 unit_path=/etc/systemd/system/ollama.service
 write_unit=0
 if ! systemctl cat ollama.service >/dev/null 2>&1; then
@@ -1675,9 +1768,6 @@ elif [ -f "$unit_path" ] && grep -Fqx 'Description=Ollama Service' "$unit_path";
   grep -Eq '^ExecStart=.*[/ ]ollama[[:space:]]+serve([[:space:]]|$)' "$unit_path" || write_unit=1
 fi
 if [ "$write_unit" -eq 1 ]; then
-  getent group ollama >/dev/null 2>&1 || groupadd --system ollama
-  id -u ollama >/dev/null 2>&1 || useradd --system --gid ollama --home-dir /usr/share/ollama --create-home --shell /sbin/nologin ollama
-  install -d -o ollama -g ollama -m 0755 /usr/share/ollama
   ollama_bin="$(command -v ollama)"
   unit_tmp="$(mktemp "$unit_path.XXXXXX")"
   trap 'rm -f -- "$unit_tmp"' EXIT
@@ -1706,9 +1796,14 @@ fi
 
 install -d -o root -g root -m 0755 /etc/systemd/system/ollama.service.d
 cat > /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf <<EOF
+[Unit]
+RequiresMountsFor=/data
+ConditionPathIsMountPoint=/data
+
 [Service]
 Environment="OLLAMA_HOST=0.0.0.0:11434"
 Environment="OLLAMA_CONTEXT_LENGTH=$ollama_context_length"
+Environment="OLLAMA_MODELS=/data/ollama/models"
 EOF
 chown root:root /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf
 chmod 0644 /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf
@@ -1781,6 +1876,19 @@ elif ! wait_for_ollama; then
   fi
 fi
 
+mountpoint -q /data && [ "$(findmnt -n -o MAJ:MIN --target /data)" = "$data_device" ] || {
+  printf 'Error: persistent storage is no longer mounted at /data\n' >&2
+  exit 1
+}
+[ ! -L "$OLLAMA_MODELS" ] && [ "$(findmnt -n -o MAJ:MIN --target "$OLLAMA_MODELS")" = "$data_device" ] &&
+  [ "$(stat -c '%u:%g:%a:%F' -- "$OLLAMA_MODELS")" = "$ollama_uid:$ollama_gid:755:directory" ] || {
+  printf 'Error: persistent Ollama model directory verification failed\n' >&2
+  exit 1
+}
+setpriv --reuid="$ollama_uid" --regid="$ollama_gid" --clear-groups /usr/bin/test -w "$OLLAMA_MODELS" || {
+  printf 'Error: persistent Ollama model directory is not writable by ollama\n' >&2
+  exit 1
+}
 case "${model##*/}" in *:*) model_latest="$model" ;; *) model_latest="$model:latest" ;; esac
 if ! ollama list | awk 'NR > 1 { print $1 }' | grep -Fxq -- "$model_latest"; then
   ollama pull "$model"
@@ -1838,6 +1946,7 @@ ensure_ollama() {
   local state
   OLLAMA_READY="0"
   save_state
+  prepare_storage
   resolve_gpu_capability
   if [ -z "$OLLAMA_CIDR" ] || { [ "$PORT_CIDR_EXPLICIT" -eq 1 ] && [ "$PORT_CIDR" != "$OLLAMA_CIDR" ]; }; then
     configure_ollama_cidr
@@ -1949,6 +2058,7 @@ create_vm() {
       running)
         if [ "$OLLAMA_MODE" = "1" ] && [ "$OLLAMA_READY" = "0" ]; then
           info "Resuming Ollama setup for $INSTANCE_ID"
+          initialize_storage
           ensure_ollama
           print_commands
           return
@@ -1996,6 +2106,7 @@ create_vm() {
   info "Preparing persistent EBS storage"
   ensure_volume
   create_instance
+  initialize_storage
   ensure_managed_ingress 22 "$SSH_CIDR" ssh
   info "SSH port 22 is restricted to $SSH_CIDR across all attached security groups"
   if [ "$OLLAMA_MODE" = "1" ]; then ensure_ollama; fi
@@ -2865,6 +2976,16 @@ prepare_storage() {
   unframe_storage_result "$result"
   parse_storage_result "$STORAGE_RESULT"
   info "Persistent storage ready: name=$NAME volume=$VOLUME_ID uuid=$STORAGE_UUID path=/data"
+}
+
+initialize_storage() {
+  local result
+  resolve_existing_volume
+  prepare_storage_endpoint
+  result="$(run_remote_storage init "FORMAT $VOLUME_ID")"
+  unframe_storage_result "$result"
+  parse_storage_result "$STORAGE_RESULT"
+  info "Initialized and mounted persistent storage: name=$NAME volume=$VOLUME_ID uuid=$STORAGE_UUID path=/data"
 }
 
 init_storage() {
