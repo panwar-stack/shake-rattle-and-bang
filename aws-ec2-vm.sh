@@ -10,6 +10,7 @@ readonly DEFAULT_MODEL_MEMORY_GIB="16"
 readonly DEFAULT_DISK_GIB="50"
 readonly DEFAULT_ROOT_DISK_GIB="30"
 readonly DEFAULT_MODEL="gemma3:4b"
+readonly DEFAULT_OLLAMA_CONTEXT_LENGTH="65536"
 readonly OLLAMA_PORT="11434"
 readonly DEFAULT_REGION="us-east-1"
 readonly DEVICE_NAME="/dev/sdf"
@@ -41,6 +42,8 @@ PORT_CIDR=""
 PORT_CIDR_EXPLICIT=0
 MODEL="$DEFAULT_MODEL"
 MODEL_EXPLICIT=0
+OLLAMA_CONTEXT_LENGTH="$DEFAULT_OLLAMA_CONTEXT_LENGTH"
+OLLAMA_CONTEXT_LENGTH_EXPLICIT=0
 OLLAMA_CIDR=""
 OLLAMA_READY="0"
 OLLAMA_MODE=""
@@ -155,6 +158,7 @@ CREATE OPTIONS
                         Select a default subnet in AZ (create only)
   --ssh-cidr CIDR       IPv4 CIDR allowed to SSH; default: your public IP /32
   --model MODEL         Opt into Ollama and pull/test MODEL (recommended: gemma3:4b)
+  --context-length N    Override Ollama context length (default: 65536; requires --model)
   --cidr CIDR           IPv4 CIDR allowed to reach Ollama; requires Ollama mode
 
 COMMON OPTIONS
@@ -181,7 +185,7 @@ PORT OPTIONS
 EXAMPLES
   ./aws-ec2-vm.sh setup
   ./aws-ec2-vm.sh create                    # small 2 vCPU / 4 GiB development VM
-  ./aws-ec2-vm.sh create llmbox --model gemma4 --instance-type g6.xlarge --disk 100
+  ./aws-ec2-vm.sh create llmbox --model gemma4 --context-length=216000 --instance-type g6.xlarge --disk 100
   ./aws-ec2-vm.sh create devbox --vcpus 4 --memory 8 --disk 200
   ./aws-ec2-vm.sh create devbox --region us-east-1 --availability-zone us-east-1b
   ./aws-ec2-vm.sh status mlbox
@@ -273,6 +277,8 @@ parse_args() {
       --availability-zone) need_value "$@"; AVAILABILITY_ZONE="$2"; AVAILABILITY_ZONE_EXPLICIT=1; shift 2 ;;
       --ssh-cidr) need_value "$@"; SSH_CIDR="$2"; shift 2 ;;
       --model) need_value "$@"; MODEL="$2"; MODEL_EXPLICIT=1; shift 2 ;;
+      --context-length) need_value "$@"; OLLAMA_CONTEXT_LENGTH="$2"; OLLAMA_CONTEXT_LENGTH_EXPLICIT=1; shift 2 ;;
+      --context-length=*) OLLAMA_CONTEXT_LENGTH="${1#*=}"; OLLAMA_CONTEXT_LENGTH_EXPLICIT=1; shift ;;
       --cidr) need_value "$@"; PORT_CIDR="$2"; PORT_CIDR_EXPLICIT=1; shift 2 ;;
       --forward-agent) SSH_FORWARD_AGENT=1; shift ;;
       --tty) SSH_TTY=1; shift ;;
@@ -295,7 +301,9 @@ validate_args() {
   is_uint "$VCPUS" || die "--vcpus must be a positive integer"
   is_uint "$MEMORY_GIB" || die "--memory must be a positive integer"
   is_uint "$DISK_GIB" || die "--disk must be a positive integer"
+  is_uint "$OLLAMA_CONTEXT_LENGTH" || die "--context-length must be a positive integer"
   case "$VCPUS:$MEMORY_GIB:$DISK_GIB" in *:0*|0*) die "numeric values must not have leading zeros" ;; esac
+  case "$OLLAMA_CONTEXT_LENGTH" in 0*) die "--context-length must not have leading zeros" ;; esac
   [ "$DISK_GIB" -le 16384 ] || die "--disk exceeds gp3's 16384 GiB limit"
   case "$REGION" in *[!a-z0-9-]*) [ -z "$REGION" ] || die "invalid region: $REGION" ;; esac
   if [ "$AVAILABILITY_ZONE_EXPLICIT" -eq 1 ]; then
@@ -315,6 +323,8 @@ validate_args() {
   [ "$COMMAND" = "expose-port" ] || [ "$COMMAND" = "create" ] || [ -z "$PORT_CIDR" ] || die "--cidr is supported only by create and expose-port"
   [ "$COMMAND" = "create" ] || [ -z "$SSH_CIDR" ] || die "--ssh-cidr is supported only by create"
   [ "$COMMAND" = "create" ] || [ "$MODEL_EXPLICIT" -eq 0 ] || die "--model is supported only by create"
+  [ "$COMMAND" = "create" ] || [ "$OLLAMA_CONTEXT_LENGTH_EXPLICIT" -eq 0 ] || die "--context-length is supported only by create"
+  [ "$OLLAMA_CONTEXT_LENGTH_EXPLICIT" -eq 0 ] || [ "$MODEL_EXPLICIT" -eq 1 ] || die "--context-length requires --model"
   [ "$COMMAND" = "create" ] || [ "$AVAILABILITY_ZONE_EXPLICIT" -eq 0 ] || die "--availability-zone is supported only by create"
   if [ "$MOUNT_DIR_EXPLICIT" -eq 1 ]; then
     [ -n "$MOUNT_DIR" ] || die "--mount-dir requires a non-empty path"
@@ -387,7 +397,7 @@ save_state() {
   local tmp="$STATE_FILE.tmp.$$" key value
   umask 077
   : > "$tmp"
-  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID SG_CREATE_PENDING KEY_NAME KEY_PATH KEY_IMPORT_PENDING AMI_ID AMI_INSTANCE_TYPE AMI_GPU_CLASS AMI_INSTANCE_TOKEN INSTANCE_TYPE VCPUS MEMORY_GIB DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_MODE OLLAMA_CIDR OLLAMA_READY CLEAN_INSTANCE_ID; do
+  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID SG_CREATE_PENDING KEY_NAME KEY_PATH KEY_IMPORT_PENDING AMI_ID AMI_INSTANCE_TYPE AMI_GPU_CLASS AMI_INSTANCE_TOKEN INSTANCE_TYPE VCPUS MEMORY_GIB DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_CONTEXT_LENGTH OLLAMA_MODE OLLAMA_CIDR OLLAMA_READY CLEAN_INSTANCE_ID; do
     eval "value=\${$key}"
     case "$value" in *$'\n'*|*$'\r'*) rm -f "$tmp"; die "state value contains a newline" ;; esac
     printf '%s=%s\n' "$key" "$value" >> "$tmp"
@@ -435,6 +445,7 @@ load_state() {
       INSTANCE_TOKEN) INSTANCE_TOKEN="$value" ;;
       INSTANCE_READY) INSTANCE_READY="$value" ;;
       MODEL) [ "$MODEL_EXPLICIT" -eq 1 ] || MODEL="$value" ;;
+      OLLAMA_CONTEXT_LENGTH) [ "$OLLAMA_CONTEXT_LENGTH_EXPLICIT" -eq 1 ] || OLLAMA_CONTEXT_LENGTH="$value" ;;
       OLLAMA_MODE) OLLAMA_MODE="$value"; ollama_mode_present=1 ;;
       OLLAMA_CIDR) OLLAMA_CIDR="$value" ;;
       OLLAMA_READY) OLLAMA_READY="$value" ;;
@@ -470,6 +481,8 @@ load_state() {
     die "saved volume token $VOLUME_TOKEN is bound to $SAVED_DISK_GIB GiB, not requested size $DISK_GIB GiB"
   fi
   [[ "$MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$ ]] || die "invalid Ollama model in state"
+  is_uint "$OLLAMA_CONTEXT_LENGTH" || die "invalid Ollama context length in state"
+  case "$OLLAMA_CONTEXT_LENGTH" in 0*) die "invalid Ollama context length with leading zeros in state" ;; esac
   [ -z "$OLLAMA_CIDR" ] || valid_cidr "$OLLAMA_CIDR" || die "invalid Ollama CIDR in state"
   case "$OLLAMA_READY" in 0|1) ;; *) die "invalid Ollama readiness marker in state" ;; esac
   case "$OLLAMA_MODE" in 0|1) ;; *) die "invalid Ollama mode marker in state" ;; esac
@@ -1558,13 +1571,14 @@ ensure_ollama_remote() {
   info "Ensuring Ollama service and model $MODEL"
   # Remote values are passed separately and interpreted only as data.
   # shellcheck disable=SC2029
-  ssh "${SSH_ARGS[@]}" "ec2-user@$PUBLIC_IP" "sudo -n /bin/bash -s -- $(shell_quote "$MODEL") $(shell_quote "$NVIDIA_GPU_PREFERRED") $(shell_quote "$OLLAMA_VERSION") $(shell_quote "$OLLAMA_SHA256") $(shell_quote "$OLLAMA_ARCHIVE_URL")" <<'REMOTE_OLLAMA' || die "Ollama provisioning failed on $INSTANCE_ID"
+  ssh "${SSH_ARGS[@]}" "ec2-user@$PUBLIC_IP" "sudo -n /bin/bash -s -- $(shell_quote "$MODEL") $(shell_quote "$NVIDIA_GPU_PREFERRED") $(shell_quote "$OLLAMA_VERSION") $(shell_quote "$OLLAMA_SHA256") $(shell_quote "$OLLAMA_ARCHIVE_URL") $(shell_quote "$OLLAMA_CONTEXT_LENGTH")" <<'REMOTE_OLLAMA' || die "Ollama provisioning failed on $INSTANCE_ID"
 set -Eeuo pipefail
 model="$1"
 gpu_preferred="$2"
 ollama_version="$3"
 ollama_sha256="$4"
 ollama_archive_url="$5"
+ollama_context_length="$6"
 
 case "$gpu_preferred" in
   0|1) ;;
@@ -1576,6 +1590,10 @@ if ! [[ "$ollama_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 if [ "${#ollama_sha256}" -ne 64 ] || [[ "$ollama_sha256" == *[!0-9a-f]* ]]; then
   printf 'Error: invalid Ollama checksum passed to remote provisioning\n' >&2
+  exit 1
+fi
+if ! [[ "$ollama_context_length" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'Error: invalid Ollama context length passed to remote provisioning\n' >&2
   exit 1
 fi
 expected_archive_url="https://github.com/ollama/ollama/releases/download/v${ollama_version}/ollama-linux-amd64.tar.zst"
@@ -1687,10 +1705,10 @@ EOF
 fi
 
 install -d -o root -g root -m 0755 /etc/systemd/system/ollama.service.d
-cat > /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf <<'EOF'
+cat > /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf <<EOF
 [Service]
 Environment="OLLAMA_HOST=0.0.0.0:11434"
-Environment="OLLAMA_CONTEXT_LENGTH=65536"
+Environment="OLLAMA_CONTEXT_LENGTH=$ollama_context_length"
 EOF
 chown root:root /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf
 chmod 0644 /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf
