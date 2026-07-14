@@ -65,6 +65,7 @@ aws_text() {
   case "$1:$2:$*" in
     ec2:describe-volumes:*) printf '%s\n' "$INSTANCE_ID" ;;
     ec2:modify-instance-attribute:*) ;;
+    ec2:describe-instances:*InstanceType*) printf '%s\n' 'i-healthcheck t3.small ami-health subnet-health us-east-1a aws-vm-health token-health running sg-health dev-vm aws-ec2-vm' ;;
     ec2:describe-instances:*) printf '%s\n' false ;;
     *) printf 'Unexpected aws_text call: %s\n' "$*" >&2; return 97 ;;
   esac
@@ -80,6 +81,15 @@ refresh_public_ip() { :; }
 AWS=(mock_waiter_aws)
 INSTANCE_ID="i-healthcheck"
 VOLUME_ID="vol-healthcheck"
+AMI_ID="ami-health"
+AMI_INSTANCE_TYPE="t3.small"
+SUBNET_ID="subnet-health"
+AZ="us-east-1a"
+KEY_NAME="aws-vm-health"
+SG_ID="sg-health"
+INSTANCE_TOKEN="token-health"
+AMI_INSTANCE_TOKEN="token-health"
+VERIFIED_INSTANCE_ID=""
 set +e
 output="$(create_instance 2>&1)"
 status=$?

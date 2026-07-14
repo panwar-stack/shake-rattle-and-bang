@@ -23,6 +23,7 @@ REGION_EXPLICIT=0
 VCPUS="$DEFAULT_VCPUS"
 MEMORY_GIB="$DEFAULT_MEMORY_GIB"
 DISK_GIB="$DEFAULT_DISK_GIB"
+SAVED_DISK_GIB=""
 VCPUS_EXPLICIT=0
 MEMORY_EXPLICIT=0
 DISK_EXPLICIT=0
@@ -86,8 +87,12 @@ VOLUME_ID=""
 VPC_ID=""
 AZ=""
 SG_ID=""
+SG_CREATE_PENDING="0"
+SG_CREATE_PENDING_PRESENT="0"
 KEY_NAME=""
 KEY_PATH=""
+KEY_IMPORT_PENDING="0"
+KEY_IMPORT_PENDING_PRESENT="0"
 AMI_ID=""
 AMI_INSTANCE_TYPE=""
 AMI_GPU_CLASS=""
@@ -102,6 +107,22 @@ INSTANCE_READY="0"
 LOCK_DIR=""
 MOUNT_PATH_LOCK_DIR=""
 MOUNT_CLAIM_FILE=""
+SG_SCOPE_CSV=""
+SG_RULE_INVENTORY=""
+SG_DESIRED_IDS=""
+SG_STALE_IDS=""
+SG_OWNED_CIDRS=""
+SG_CONFLICT_DETAILS=""
+SG_EFFECTIVE_DETAILS=""
+SG_DESIRED_COUNT=0
+SG_OWNED_COUNT=0
+SG_CONFLICT_COUNT=0
+SG_EFFECTIVE_COUNT=0
+SG_SKIP_INSTANCE_SCOPE=0
+VALIDATED_INSTANCE_ID=""
+VALIDATED_INSTANCE_TYPE=""
+VALIDATED_INSTANCE_STATE=""
+VERIFIED_INSTANCE_ID=""
 
 info() { printf '==> %s\n' "$*" >&2; }
 warn() { printf 'Warning: %s\n' "$*" >&2; }
@@ -292,6 +313,7 @@ validate_args() {
   fi
   [ -z "$PORT_CIDR" ] || valid_cidr "$PORT_CIDR" || die "invalid IPv4 CIDR: $PORT_CIDR"
   [ "$COMMAND" = "expose-port" ] || [ "$COMMAND" = "create" ] || [ -z "$PORT_CIDR" ] || die "--cidr is supported only by create and expose-port"
+  [ "$COMMAND" = "create" ] || [ -z "$SSH_CIDR" ] || die "--ssh-cidr is supported only by create"
   [ "$COMMAND" = "create" ] || [ "$MODEL_EXPLICIT" -eq 0 ] || die "--model is supported only by create"
   [ "$COMMAND" = "create" ] || [ "$AVAILABILITY_ZONE_EXPLICIT" -eq 0 ] || die "--availability-zone is supported only by create"
   if [ "$MOUNT_DIR_EXPLICIT" -eq 1 ]; then
@@ -365,7 +387,7 @@ save_state() {
   local tmp="$STATE_FILE.tmp.$$" key value
   umask 077
   : > "$tmp"
-  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID KEY_NAME KEY_PATH AMI_ID AMI_INSTANCE_TYPE AMI_GPU_CLASS AMI_INSTANCE_TOKEN INSTANCE_TYPE VCPUS MEMORY_GIB DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_MODE OLLAMA_CIDR OLLAMA_READY CLEAN_INSTANCE_ID; do
+  for key in PROFILE REGION ACCOUNT_ID INSTANCE_ID VOLUME_ID VPC_ID SUBNET_ID AZ SG_ID SG_CREATE_PENDING KEY_NAME KEY_PATH KEY_IMPORT_PENDING AMI_ID AMI_INSTANCE_TYPE AMI_GPU_CLASS AMI_INSTANCE_TOKEN INSTANCE_TYPE VCPUS MEMORY_GIB DISK_GIB PUBLIC_IP VOLUME_TOKEN INSTANCE_TOKEN INSTANCE_READY MODEL OLLAMA_MODE OLLAMA_CIDR OLLAMA_READY CLEAN_INSTANCE_ID; do
     eval "value=\${$key}"
     case "$value" in *$'\n'*|*$'\r'*) rm -f "$tmp"; die "state value contains a newline" ;; esac
     printf '%s=%s\n' "$key" "$value" >> "$tmp"
@@ -395,8 +417,10 @@ load_state() {
         ;;
       AZ) AZ="$value" ;;
       SG_ID) SG_ID="$value" ;;
+      SG_CREATE_PENDING) SG_CREATE_PENDING="$value"; SG_CREATE_PENDING_PRESENT="1" ;;
       KEY_NAME) KEY_NAME="$value" ;;
       KEY_PATH) KEY_PATH="$value" ;;
+      KEY_IMPORT_PENDING) KEY_IMPORT_PENDING="$value"; KEY_IMPORT_PENDING_PRESENT="1" ;;
       AMI_ID) AMI_ID="$value" ;;
       AMI_INSTANCE_TYPE) AMI_INSTANCE_TYPE="$value"; AMI_BINDINGS_PRESENT=1 ;;
       AMI_GPU_CLASS) AMI_GPU_CLASS="$value"; AMI_BINDINGS_PRESENT=1 ;;
@@ -404,7 +428,7 @@ load_state() {
       INSTANCE_TYPE) SAVED_INSTANCE_TYPE="$value"; [ "$INSTANCE_TYPE_EXPLICIT" -eq 1 ] || INSTANCE_TYPE="$value" ;;
       VCPUS) VCPUS_SAVED=1; [ "$VCPUS_EXPLICIT" -eq 1 ] || VCPUS="$value" ;;
       MEMORY_GIB) MEMORY_SAVED=1; [ "$MEMORY_EXPLICIT" -eq 1 ] || MEMORY_GIB="$value" ;;
-      DISK_GIB) [ "$DISK_EXPLICIT" -eq 1 ] || DISK_GIB="$value" ;;
+      DISK_GIB) SAVED_DISK_GIB="$value"; [ "$DISK_EXPLICIT" -eq 1 ] || DISK_GIB="$value" ;;
       SPOT) case "$value" in 0|1) ;; *) die "invalid legacy Spot marker in state" ;; esac ;;
       PUBLIC_IP) PUBLIC_IP="$value" ;;
       VOLUME_TOKEN) VOLUME_TOKEN="$value" ;;
@@ -433,12 +457,18 @@ load_state() {
   case "${INSTANCE_ID#i-}" in ''|*[!a-zA-Z0-9]*) [ -z "$INSTANCE_ID" ] || die "invalid instance ID in state" ;; esac
   case "$VOLUME_ID" in ''|vol-[a-zA-Z0-9]*) ;; *) die "invalid volume ID in state" ;; esac
   case "$SG_ID" in ''|sg-[a-zA-Z0-9]*) ;; *) die "invalid security group ID in state" ;; esac
+  case "$SG_CREATE_PENDING" in 0|1) ;; *) die "invalid security group creation marker in state" ;; esac
+  case "$KEY_IMPORT_PENDING" in 0|1) ;; *) die "invalid key import marker in state" ;; esac
   case "$INSTANCE_READY" in 0|1) ;; *) die "invalid readiness marker in state" ;; esac
   case "$AMI_GPU_CLASS" in ''|generic|nvidia) ;; *) die "invalid AMI GPU class in state" ;; esac
   is_uint "$VCPUS" || die "invalid vCPU count in state"
   is_uint "$MEMORY_GIB" || die "invalid memory size in state"
   case "$VCPUS:$MEMORY_GIB" in *:0*|0*) die "invalid numeric value with leading zeros in state" ;; esac
   is_uint "$DISK_GIB" || die "invalid disk size in state"
+  is_uint "$SAVED_DISK_GIB" || die "invalid saved disk size in state"
+  if [ -z "$VOLUME_ID" ] && [ -n "$VOLUME_TOKEN" ] && [ "$DISK_EXPLICIT" -eq 1 ] && [ "$DISK_GIB" != "$SAVED_DISK_GIB" ]; then
+    die "saved volume token $VOLUME_TOKEN is bound to $SAVED_DISK_GIB GiB, not requested size $DISK_GIB GiB"
+  fi
   [[ "$MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$ ]] || die "invalid Ollama model in state"
   [ -z "$OLLAMA_CIDR" ] || valid_cidr "$OLLAMA_CIDR" || die "invalid Ollama CIDR in state"
   case "$OLLAMA_READY" in 0|1) ;; *) die "invalid Ollama readiness marker in state" ;; esac
@@ -639,15 +669,22 @@ setup() {
 
 aws_text() { "${AWS[@]}" "$@" --output text; }
 
+reconciliation_sleep() {
+  sleep "${AWS_VM_RECONCILE_SLEEP_SECONDS:-2}"
+}
+
 discover_ssh_cidr() {
-  [ -n "$SSH_CIDR" ] && return 0
+  if [ -n "$SSH_CIDR" ]; then
+    SSH_CIDR="$(canonicalize_cidr "$SSH_CIDR")" || die "invalid IPv4 CIDR: $SSH_CIDR"
+    return
+  fi
   command -v curl >/dev/null 2>&1 || die "set --ssh-cidr because curl is unavailable"
   local ip
   ip="$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)"
   case "$ip" in ''|*[!0-9.]*) die "could not detect your public IPv4 address; pass --ssh-cidr YOUR_IP/32" ;; esac
   SSH_CIDR="$ip/32"
   valid_cidr "$SSH_CIDR" || die "public IP service returned an invalid address; pass --ssh-cidr YOUR_IP/32"
-  info "SSH access restricted to $SSH_CIDR"
+  info "Using detected SSH CIDR $SSH_CIDR"
 }
 
 discover_port_cidr() {
@@ -661,7 +698,7 @@ discover_port_cidr() {
   local ip
   ip="$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)"
   PORT_CIDR="$(canonicalize_cidr "$ip/32")" || die "could not detect your public IPv4 address; pass --cidr YOUR_IP/32"
-  info "TCP port $PORT access restricted to $PORT_CIDR"
+  info "Using detected TCP port CIDR $PORT_CIDR"
 }
 
 apply_requested_availability_zone() {
@@ -677,14 +714,25 @@ apply_requested_availability_zone() {
 
 resolve_existing_volume() {
   [ -n "$VOLUME_ID" ] || return 0
-  local result volume_az state attachment attached_state
-  result="$(aws_text ec2 describe-volumes --volume-ids "$VOLUME_ID" --query 'Volumes[0].[AvailabilityZone,State,Attachments[0].InstanceId]')" || die "cannot inspect persistent volume $VOLUME_ID"
-  volume_az="$(printf '%s\n' "$result" | awk '{print $1}')"
-  state="$(printf '%s\n' "$result" | awk '{print $2}')"
-  attachment="$(printf '%s\n' "$result" | awk '{print $3}')"
+  local result volume_az state volume_size volume_type encrypted multi_attach attachment name_tag managed_by creation_tag extra attached_state
+  result="$(aws_text ec2 describe-volumes --volume-ids "$VOLUME_ID" --query "Volumes[0].[AvailabilityZone,State,Size,VolumeType,Encrypted,MultiAttachEnabled,Attachments[0].InstanceId,Tags[?Key=='Name']|[0].Value,Tags[?Key=='ManagedBy']|[0].Value,Tags[?Key=='CreationToken']|[0].Value]")" ||
+    die "cannot inspect persistent volume $VOLUME_ID"
+  read -r volume_az state volume_size volume_type encrypted multi_attach attachment name_tag managed_by creation_tag extra <<< "$result"
+  [ -z "$extra" ] || die "persistent volume $VOLUME_ID returned malformed identity"
   [ -n "$volume_az" ] && [ "$volume_az" != "None" ] || die "persistent volume $VOLUME_ID no longer exists"
   [ -z "$AZ" ] || [ "$AZ" = "$volume_az" ] ||
     die "persistent volume $VOLUME_ID is in $volume_az, not selected Availability Zone $AZ"
+  [ "$volume_size" = "$DISK_GIB" ] && [ "$volume_type" = "gp3" ] &&
+    { [ "$encrypted" = "True" ] || [ "$encrypted" = "true" ]; } &&
+    { [ "$multi_attach" = "False" ] || [ "$multi_attach" = "false" ]; } ||
+    die "persistent volume $VOLUME_ID does not match saved size, gp3 type, encryption, and multi-attach settings"
+  [ "$name_tag" = "$NAME-data" ] && [ "$managed_by" = "aws-ec2-vm" ] ||
+    die "persistent volume $VOLUME_ID is not exactly owned by aws-ec2-vm name '$NAME-data'"
+  case "$creation_tag" in
+    ''|None) ;;
+    "$VOLUME_TOKEN") [ -n "$VOLUME_TOKEN" ] || die "persistent volume $VOLUME_ID has an unexpected creation token" ;;
+    *) die "persistent volume $VOLUME_ID has a mismatched creation token" ;;
+  esac
   AZ="$volume_az"
   case "$state" in
     available) ;;
@@ -786,51 +834,286 @@ verify_instance_offering() {
   [ "$count" != "0" ] || die "$INSTANCE_TYPE is not offered in $AZ; pass another --instance-type"
 }
 
-ensure_key() {
-  KEY_NAME="${KEY_NAME:-aws-vm-$NAME}"
-  KEY_PATH="${KEY_PATH:-$STATE_DIR/keys/$NAME}"
-  if aws_text ec2 describe-key-pairs --key-names "$KEY_NAME" --query 'KeyPairs[0].KeyName' >/dev/null 2>&1; then
-    [ -f "$KEY_PATH" ] || die "AWS key $KEY_NAME exists but private key $KEY_PATH is missing; choose a different NAME or restore the key"
-    return
-  fi
+canonical_public_key() {
+  local value="$1" algorithm material remainder
+  case "$value" in *$'\n'*|*$'\r'*) return 1 ;; esac
+  read -r algorithm material remainder <<< "$value"
+  case "$algorithm" in ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) ;; *) return 1 ;; esac
+  case "$material" in ''|*[!A-Za-z0-9+/=]*) return 1 ;; esac
+  printf '%s %s\n' "$algorithm" "$material"
+}
+
+local_key_public_material() {
   command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required"
-  [ ! -e "$KEY_PATH" ] && [ ! -e "$KEY_PATH.pub" ] || die "local key $KEY_PATH exists but AWS key $KEY_NAME does not; resolve this mismatch manually"
-  mkdir -p "$(dirname "$KEY_PATH")"
-  chmod 700 "$(dirname "$KEY_PATH")"
+  [ -f "$KEY_PATH" ] && [ ! -L "$KEY_PATH" ] || die "managed private key is missing or unsafe: $KEY_PATH"
+  [ -f "$KEY_PATH.pub" ] && [ ! -L "$KEY_PATH.pub" ] || die "managed public key is missing or unsafe: $KEY_PATH.pub"
+  local private_public file_public private_canonical file_canonical
+  private_public="$(ssh-keygen -y -f "$KEY_PATH" 2>/dev/null)" || die "cannot derive the public key from managed private key $KEY_PATH"
+  file_public="$(< "$KEY_PATH.pub")"
+  private_canonical="$(canonical_public_key "$private_public")" || die "managed private key $KEY_PATH produced invalid public material"
+  file_canonical="$(canonical_public_key "$file_public")" || die "managed public key $KEY_PATH.pub is invalid"
+  [ "$private_canonical" = "$file_canonical" ] || die "managed private and public keys do not match for $KEY_PATH"
+  printf '%s\n' "$private_canonical"
+}
+
+inspect_key_pair_once() {
+  local require_tags="$1" result count row actual_name aws_public name_tag managed_by extra
+  local expected_public aws_canonical
+  if ! result="$(aws_text ec2 describe-key-pairs --key-names "$KEY_NAME" --include-public-key --query "KeyPairs[].[KeyName,PublicKey,Tags[?Key=='Name']|[0].Value,Tags[?Key=='ManagedBy']|[0].Value]" 2>&1)"; then
+    case "$result" in 'An error occurred (InvalidKeyPair.NotFound) when calling the DescribeKeyPairs operation:'*) return 1 ;; esac
+    die "cannot reconcile key pair $KEY_NAME: $result"
+  fi
+  case "$result" in ''|None) die "exact key-name lookup for $KEY_NAME returned an empty result" ;; esac
+  count="$(printf '%s\n' "$result" | awk 'NF { count++ } END { print count + 0 }')"
+  [ "$count" -eq 1 ] || die "key name $KEY_NAME matched $count key pairs; refusing ambiguous recovery"
+  row="$(printf '%s\n' "$result" | awk 'NF { print; exit }')"
+  IFS=$'\t' read -r actual_name aws_public name_tag managed_by extra <<< "$row"
+  [ -z "$extra" ] && [ "$actual_name" = "$KEY_NAME" ] || die "AWS returned malformed identity for key pair $KEY_NAME"
+  aws_canonical="$(canonical_public_key "$aws_public")" || die "AWS returned invalid public material for key pair $KEY_NAME"
+  if [ -f "$KEY_PATH" ] && [ ! -L "$KEY_PATH" ] && [ -f "$KEY_PATH.pub" ] && [ ! -L "$KEY_PATH.pub" ]; then
+    expected_public="$(local_key_public_material)" || die "cannot verify local public material for key pair $KEY_NAME"
+    [ "$aws_canonical" = "$expected_public" ] || die "AWS key pair $KEY_NAME does not match the managed local key"
+  else
+    die "managed local key files are incomplete or unsafe for key pair verification: $KEY_PATH"
+  fi
+  if [ "$require_tags" -eq 1 ]; then
+    [ "$name_tag" = "aws-vm-$NAME" ] && [ "$managed_by" = "aws-ec2-vm" ] ||
+      die "key pair $KEY_NAME does not have exact aws-ec2-vm ownership tags"
+  else
+    case "$name_tag:$managed_by" in
+      "aws-vm-$NAME:aws-ec2-vm"|None:None|:) ;;
+      *) die "key pair $KEY_NAME has conflicting ownership tags" ;;
+    esac
+  fi
+}
+
+reconcile_pending_key_import() {
+  local attempt=1
+  while [ "$attempt" -le 3 ]; do
+    if inspect_key_pair_once 1; then
+      KEY_IMPORT_PENDING="0"
+      save_state
+      info "Recovered imported key pair $KEY_NAME"
+      return 0
+    fi
+    [ "$attempt" -eq 3 ] || reconciliation_sleep
+    attempt=$((attempt + 1))
+  done
+  die "key import for $KEY_NAME remained absent after 3 reconciliation reads; refusing a duplicate-prone import"
+}
+
+require_key_name_absent() {
+  local result
+  if ! result="$(aws_text ec2 describe-key-pairs --key-names "$KEY_NAME" --include-public-key --query 'KeyPairs[].KeyName' 2>&1)"; then
+    case "$result" in 'An error occurred (InvalidKeyPair.NotFound) when calling the DescribeKeyPairs operation:'*) return 0 ;; esac
+    die "cannot check key name $KEY_NAME before import: $result"
+  fi
+  case "$result" in ''|None) die "exact key-name lookup for $KEY_NAME returned an empty result" ;; esac
+  die "AWS key name $KEY_NAME already exists but no matching managed local key was recorded; refusing import"
+}
+
+regenerate_public_key() {
+  local derived canonical tmp
+  derived="$(ssh-keygen -y -f "$KEY_PATH" 2>/dev/null)" || die "cannot derive the missing public key from $KEY_PATH"
+  canonical="$(canonical_public_key "$derived")" || die "managed private key $KEY_PATH produced invalid public material"
   umask 077
-  ssh-keygen -q -t ed25519 -N '' -C "$KEY_NAME" -f "$KEY_PATH"
-  aws_text ec2 import-key-pair --key-name "$KEY_NAME" --public-key-material "fileb://$KEY_PATH.pub" --query KeyPairId >/dev/null
-  save_state
+  tmp="$(mktemp "$KEY_PATH.pub.tmp.XXXXXX")" || die "cannot create a temporary public key beside $KEY_PATH"
+  if ! printf '%s %s\n' "$canonical" "$KEY_NAME" > "$tmp"; then
+    rm -f -- "$tmp"
+    die "cannot write regenerated public key for $KEY_PATH"
+  fi
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; die "cannot secure regenerated public key for $KEY_PATH"; }
+  if [ -e "$KEY_PATH.pub" ] || [ -L "$KEY_PATH.pub" ]; then
+    rm -f -- "$tmp"
+    die "public key path appeared while regenerating it: $KEY_PATH.pub"
+  fi
+  mv -- "$tmp" "$KEY_PATH.pub" || { rm -f -- "$tmp"; die "cannot install regenerated public key for $KEY_PATH"; }
+  local_key_public_material >/dev/null
+}
+
+ensure_key() {
+  local result recorded_key=0
+  [ -z "$KEY_NAME" ] && [ -z "$KEY_PATH" ] || recorded_key=1
+  if [ -z "$KEY_NAME" ] || [ -z "$KEY_PATH" ]; then
+    [ -z "$KEY_NAME" ] && [ -z "$KEY_PATH" ] || die "saved key identity is incomplete"
+    KEY_NAME="aws-vm-$NAME"
+    KEY_PATH="$STATE_DIR/keys/$NAME"
+    save_state
+  fi
+  [ "$KEY_NAME" = "aws-vm-$NAME" ] && [ "$KEY_PATH" = "$STATE_DIR/keys/$NAME" ] ||
+    die "saved key identity is not the exact managed key for '$NAME'"
+  if [ "$KEY_IMPORT_PENDING" -eq 1 ]; then
+    reconcile_pending_key_import
+    return
+  elif [ -e "$KEY_PATH" ] && [ -e "$KEY_PATH.pub" ]; then
+    if inspect_key_pair_once 0; then return; fi
+    local_key_public_material >/dev/null
+    KEY_IMPORT_PENDING="1"
+    save_state
+  elif [ "$recorded_key" -eq 1 ] && [ -f "$KEY_PATH" ] && [ ! -L "$KEY_PATH" ] && [ ! -e "$KEY_PATH.pub" ] && [ ! -L "$KEY_PATH.pub" ]; then
+    regenerate_public_key
+    if inspect_key_pair_once 0; then return; fi
+    KEY_IMPORT_PENDING="1"
+    save_state
+  elif [ -e "$KEY_PATH" ] || [ -L "$KEY_PATH" ] || [ -e "$KEY_PATH.pub" ] || [ -L "$KEY_PATH.pub" ]; then
+    die "local key $KEY_PATH exists without a matching saved AWS key identity; resolve this mismatch manually"
+  else
+    require_key_name_absent
+    mkdir -p "$(dirname "$KEY_PATH")"
+    chmod 700 "$(dirname "$KEY_PATH")"
+    umask 077
+    ssh-keygen -q -t ed25519 -N '' -C "$KEY_NAME" -f "$KEY_PATH"
+    local_key_public_material >/dev/null
+    KEY_IMPORT_PENDING="1"
+    save_state
+  fi
+  if ! result="$(aws_text ec2 import-key-pair --key-name "$KEY_NAME" --public-key-material "fileb://$KEY_PATH.pub" --tag-specifications "ResourceType=key-pair,Tags=[{Key=Name,Value=aws-vm-$NAME},{Key=ManagedBy,Value=aws-ec2-vm}]" --query KeyPairId 2>&1)"; then
+    warn "Key import returned an error; reconciling $KEY_NAME before any further replay: $result"
+  fi
+  reconcile_pending_key_import
+}
+
+inspect_security_group_by_name_once() {
+  local expected_id="${1:-}" result count recovered_id recovered_vpc recovered_name name_tag managed_by extra
+  if ! result="$(aws_text ec2 describe-security-groups --filters "Name=group-name,Values=aws-vm-$NAME" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[].[GroupId,VpcId,GroupName,Tags[?Key=='Name']|[0].Value,Tags[?Key=='ManagedBy']|[0].Value]" 2>&1)"; then
+    case "$result" in 'An error occurred (InvalidGroup.NotFound) when calling the DescribeSecurityGroups operation:'*) return 1 ;; esac
+    die "cannot reconcile security group aws-vm-$NAME: $result"
+  fi
+  case "$result" in ''|None) return 1 ;; esac
+  count="$(printf '%s\n' "$result" | awk 'NF { count++ } END { print count + 0 }')"
+  [ "$count" -eq 1 ] || die "security group name aws-vm-$NAME matched $count groups in $VPC_ID; refusing ambiguous recovery"
+  read -r recovered_id recovered_vpc recovered_name name_tag managed_by extra <<< "$result"
+  case "$recovered_id" in sg-[a-zA-Z0-9]*) ;; *) die "AWS returned an invalid security group ID for aws-vm-$NAME" ;; esac
+  [ -z "$extra" ] && [ "$recovered_vpc" = "$VPC_ID" ] && [ "$recovered_name" = "aws-vm-$NAME" ] &&
+    [ "$name_tag" = "aws-vm-$NAME" ] && [ "$managed_by" = "aws-ec2-vm" ] ||
+    die "security group aws-vm-$NAME does not have exact VPC, name, and ownership identity"
+  [ -z "$expected_id" ] || [ "$recovered_id" = "$expected_id" ] ||
+    die "saved security group $expected_id conflicts with named group $recovered_id"
+  RECOVERED_SG_ID="$recovered_id"
+}
+
+inspect_security_group_id_once() {
+  local result recovered_id recovered_vpc recovered_name name_tag managed_by extra
+  if ! result="$(aws_text ec2 describe-security-groups --group-ids "$SG_ID" --query "SecurityGroups[].[GroupId,VpcId,GroupName,Tags[?Key=='Name']|[0].Value,Tags[?Key=='ManagedBy']|[0].Value]" 2>&1)"; then
+    case "$result" in 'An error occurred (InvalidGroup.NotFound) when calling the DescribeSecurityGroups operation:'*) return 1 ;; esac
+    die "cannot inspect saved security group $SG_ID: $result"
+  fi
+  case "$result" in ''|None) die "saved security group ID $SG_ID returned an empty result" ;; esac
+  [ "$(printf '%s\n' "$result" | awk 'NF { count++ } END { print count + 0 }')" -eq 1 ] ||
+    die "saved security group ID $SG_ID returned ambiguous results"
+  read -r recovered_id recovered_vpc recovered_name name_tag managed_by extra <<< "$result"
+  [ -z "$extra" ] && [ "$recovered_id" = "$SG_ID" ] && [ "$recovered_vpc" = "$VPC_ID" ] &&
+    [ "$recovered_name" = "aws-vm-$NAME" ] && [ "$name_tag" = "aws-vm-$NAME" ] &&
+    [ "$managed_by" = "aws-ec2-vm" ] || die "saved security group $SG_ID has mismatched identity or ownership"
+}
+
+reconcile_pending_security_group() {
+  local expected_id="$SG_ID" attempt=1
+  while [ "$attempt" -le 3 ]; do
+    if inspect_security_group_by_name_once "$expected_id"; then
+      SG_ID="$RECOVERED_SG_ID"
+      SG_CREATE_PENDING="0"
+      save_state
+      info "Recovered security group $SG_ID"
+      return 0
+    fi
+    [ "$attempt" -eq 3 ] || reconciliation_sleep
+    attempt=$((attempt + 1))
+  done
+  die "security group creation for aws-vm-$NAME remained absent after 3 reconciliation reads; refusing a duplicate-prone create"
 }
 
 ensure_security_group() {
-  local found existing managed cidr
+  local result created_id=""
+  RECOVERED_SG_ID=""
   if [ -n "$SG_ID" ]; then
-    found="$(aws_text ec2 describe-security-groups --group-ids "$SG_ID" --query 'SecurityGroups[0].VpcId' 2>/dev/null || true)"
-    [ "$found" = "$VPC_ID" ] || SG_ID=""
+    if inspect_security_group_id_once; then
+      if [ "$SG_CREATE_PENDING" -eq 1 ]; then SG_CREATE_PENDING="0"; save_state; fi
+    elif [ "$SG_CREATE_PENDING" -eq 1 ]; then
+      reconcile_pending_security_group
+    else
+      SG_ID=""
+      save_state
+    fi
+  fi
+  if [ -z "$SG_ID" ] && [ "$SG_CREATE_PENDING" -eq 1 ]; then
+    reconcile_pending_security_group
   fi
   if [ -z "$SG_ID" ]; then
-    found="$(aws_text ec2 describe-security-groups --filters "Name=group-name,Values=aws-vm-$NAME" "Name=vpc-id,Values=$VPC_ID" Name=tag:ManagedBy,Values=aws-ec2-vm --query 'SecurityGroups[0].GroupId' 2>/dev/null || true)"
-    if [ -n "$found" ] && [ "$found" != "None" ]; then
-      SG_ID="$found"
+    if inspect_security_group_by_name_once; then
+      SG_ID="$RECOVERED_SG_ID"
+      save_state
     else
-      SG_ID="$(aws_text ec2 create-security-group --group-name "aws-vm-$NAME" --description "SSH for aws-ec2-vm $NAME" --vpc-id "$VPC_ID" --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=aws-vm-$NAME},{Key=ManagedBy,Value=aws-ec2-vm}]" --query GroupId)"
+      SG_CREATE_PENDING="1"
+      save_state
+      if result="$(aws_text ec2 create-security-group --group-name "aws-vm-$NAME" --description "SSH for aws-ec2-vm $NAME" --vpc-id "$VPC_ID" --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=aws-vm-$NAME},{Key=ManagedBy,Value=aws-ec2-vm}]" --query GroupId 2>&1)"; then
+        created_id="$result"
+        case "$created_id" in sg-[a-zA-Z0-9]*) ;; *) die "create-security-group returned an invalid group ID: $created_id" ;; esac
+      else
+        warn "Security group creation returned an error; reconciling the exact name without recreating: $result"
+      fi
+      SG_ID="$created_id"
+      reconcile_pending_security_group
     fi
-    save_state
   fi
-  existing="$(aws_text ec2 describe-security-groups --group-ids "$SG_ID" --query 'SecurityGroups[0].IpPermissions[?IpProtocol==`tcp` && FromPort==`22` && ToPort==`22`].IpRanges[].CidrIp')"
-  managed="$(aws_text ec2 describe-security-groups --group-ids "$SG_ID" --query "SecurityGroups[0].IpPermissions[?IpProtocol==\`tcp\` && FromPort==\`22\` && ToPort==\`22\`].IpRanges[?Description=='aws-ec2-vm'].CidrIp")"
-  case " $existing " in *" $SSH_CIDR "*) ;; *) aws_text ec2 authorize-security-group-ingress --group-id "$SG_ID" --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$SSH_CIDR,Description=aws-ec2-vm}]" >/dev/null ;; esac
-  for cidr in $managed; do
-    [ "$cidr" = "$SSH_CIDR" ] || aws_text ec2 revoke-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 22 --cidr "$cidr" >/dev/null
+  ensure_managed_ingress 22 "$SSH_CIDR" ssh
+}
+
+inspect_volume_token_once() {
+  local expected_id="${1:-}" result count recovered_id recovered_az recovered_size recovered_type encrypted multi_attach name_tag managed_by creation_tag extra
+  if ! result="$(aws_text ec2 describe-volumes --filters "Name=tag:CreationToken,Values=$VOLUME_TOKEN" --query "Volumes[].[VolumeId,AvailabilityZone,Size,VolumeType,Encrypted,MultiAttachEnabled,Tags[?Key=='Name']|[0].Value,Tags[?Key=='ManagedBy']|[0].Value,Tags[?Key=='CreationToken']|[0].Value]" 2>&1)"; then
+    case "$result" in 'An error occurred (InvalidVolume.NotFound) when calling the DescribeVolumes operation:'*) return 1 ;; esac
+    die "cannot reconcile saved volume token $VOLUME_TOKEN: $result"
+  fi
+  case "$result" in ''|None) return 1 ;; esac
+  count="$(printf '%s\n' "$result" | awk 'NF { count++ } END { print count + 0 }')"
+  [ "$count" -eq 1 ] || die "saved volume token $VOLUME_TOKEN matched $count volumes; refusing ambiguous recovery"
+  read -r recovered_id recovered_az recovered_size recovered_type encrypted multi_attach name_tag managed_by creation_tag extra <<< "$result"
+  case "$recovered_id" in vol-[a-zA-Z0-9]*) ;; *) die "saved volume token returned an invalid volume ID: $recovered_id" ;; esac
+  [ -z "$extra" ] && [ "$recovered_az" = "$AZ" ] && [ "$recovered_size" = "$DISK_GIB" ] &&
+    [ "$recovered_type" = "gp3" ] && { [ "$encrypted" = "True" ] || [ "$encrypted" = "true" ]; } &&
+    { [ "$multi_attach" = "False" ] || [ "$multi_attach" = "false" ]; } &&
+    [ "$name_tag" = "$NAME-data" ] && [ "$managed_by" = "aws-ec2-vm" ] && [ "$creation_tag" = "$VOLUME_TOKEN" ] ||
+    die "volume recovered from token $VOLUME_TOKEN does not exactly match saved size, AZ, encryption, type, multi-attach setting, and ownership"
+  [ -z "$expected_id" ] || [ "$recovered_id" = "$expected_id" ] ||
+    die "create-volume returned $expected_id but token $VOLUME_TOKEN resolved to $recovered_id"
+  VOLUME_ID="$recovered_id"
+}
+
+reconcile_volume_token() {
+  local expected_id="${1:-}" attempt=1
+  while [ "$attempt" -le 3 ]; do
+    if inspect_volume_token_once "$expected_id"; then
+      save_state
+      info "Recovered persistent volume $VOLUME_ID from saved creation token"
+      return 0
+    fi
+    [ "$attempt" -eq 3 ] || reconciliation_sleep
+    attempt=$((attempt + 1))
   done
+  return 1
 }
 
 ensure_volume() {
+  local new_intent=0 result created_id=""
   if [ -n "$VOLUME_ID" ]; then return; fi
-  if [ -z "$VOLUME_TOKEN" ]; then VOLUME_TOKEN="v-$ACCOUNT_ID-$(date +%s)-$$"; save_state; fi
-  VOLUME_ID="$(aws_text ec2 create-volume --availability-zone "$AZ" --size "$DISK_GIB" --volume-type gp3 --encrypted --client-token "$VOLUME_TOKEN" --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=$NAME-data},{Key=ManagedBy,Value=aws-ec2-vm}]" --query VolumeId)"
-  save_state
+  if [ -z "$VOLUME_TOKEN" ]; then
+    VOLUME_TOKEN="v-$ACCOUNT_ID-$(date +%s)-$$"
+    save_state
+    new_intent=1
+  fi
+  if [ "$new_intent" -eq 0 ] && reconcile_volume_token; then
+    "${AWS[@]}" ec2 wait volume-available --volume-ids "$VOLUME_ID"
+    return
+  fi
+  if result="$(aws_text ec2 create-volume --availability-zone "$AZ" --size "$DISK_GIB" --volume-type gp3 --encrypted --client-token "$VOLUME_TOKEN" --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=$NAME-data},{Key=ManagedBy,Value=aws-ec2-vm},{Key=CreationToken,Value=$VOLUME_TOKEN}]" --query VolumeId 2>&1)"; then
+    created_id="$result"
+    case "$created_id" in vol-[a-zA-Z0-9]*) ;; *) die "create-volume returned an invalid volume ID: $created_id" ;; esac
+  else
+    warn "Volume creation returned an error; reconciling the saved client token before any retry: $result"
+  fi
+  reconcile_volume_token "$created_id" ||
+    die "volume token $VOLUME_TOKEN remained absent after 3 reconciliation reads; retry create to replay only this exact client token"
   info "Created persistent volume $VOLUME_ID; it will not be deleted automatically"
   "${AWS[@]}" ec2 wait volume-available --volume-ids "$VOLUME_ID"
 }
@@ -889,14 +1172,49 @@ resolve_ami() {
 }
 
 create_instance() {
-  local prior_state="" attachment=""
+  local prior_state="" attachment="" result created_id="" expected_instance_id="" reconcile_id=""
   local -a root_mapping=()
   if [ -n "$INSTANCE_ID" ]; then
     prior_state="$(instance_state)" || return 1
+    if [ "$prior_state" = "not-found" ] && [ -n "$INSTANCE_TOKEN" ] && [ "$INSTANCE_READY" = "0" ]; then
+      expected_instance_id="$INSTANCE_ID"
+      if reconcile_instance_token "$expected_instance_id"; then prior_state="$(instance_state)" || return 1; fi
+    fi
     case "$prior_state" in
-      terminated|not-found|None|'') INSTANCE_ID=""; INSTANCE_TOKEN=""; AMI_INSTANCE_TOKEN=""; INSTANCE_READY="0"; PUBLIC_IP=""; save_state ;;
+      pending|running|shutting-down|stopping|stopped)
+        if [ "$VERIFIED_INSTANCE_ID" != "$INSTANCE_ID" ]; then
+          inspect_saved_instance_identity
+          prior_state="$VALIDATED_INSTANCE_STATE"
+        elif [ -n "$VALIDATED_INSTANCE_STATE" ]; then
+          prior_state="$VALIDATED_INSTANCE_STATE"
+        fi
+        ;;
+      terminated)
+        if [ "$VERIFIED_INSTANCE_ID" != "$INSTANCE_ID" ]; then
+          if [ "$INSTANCE_READY" = "0" ] && [ -z "$AMI_ID" ] && [ -z "$AMI_INSTANCE_TYPE" ] && [ -z "$AMI_GPU_CLASS" ] &&
+            [ -z "$INSTANCE_TOKEN" ] && [ -z "$AMI_INSTANCE_TOKEN" ]; then
+            inspect_terminated_instance_ownership
+          else
+            inspect_saved_instance_identity
+          fi
+        fi
+        prior_state="$VALIDATED_INSTANCE_STATE"
+        ;;
+    esac
+    case "$prior_state" in
+      terminated) expected_instance_id=""; VERIFIED_INSTANCE_ID=""; INSTANCE_ID=""; INSTANCE_TOKEN=""; AMI_INSTANCE_TOKEN=""; INSTANCE_READY="0"; PUBLIC_IP=""; save_state ;;
+      not-found|None|'')
+        INSTANCE_ID=""
+        INSTANCE_READY="0"
+        PUBLIC_IP=""
+        [ -n "$expected_instance_id" ] || save_state
+        ;;
       pending|running) info "Resuming setup for $INSTANCE_ID ($prior_state)" ;;
-      stopped) info "Starting partial instance $INSTANCE_ID to finish setup"; aws_text ec2 start-instances --instance-ids "$INSTANCE_ID" --query 'StartingInstances[0].CurrentState.Name' >/dev/null ;;
+      stopped)
+        preflight_existing_instance_ingress stopped
+        info "Starting partial instance $INSTANCE_ID to finish setup"
+        aws_text ec2 start-instances --instance-ids "$INSTANCE_ID" --query 'StartingInstances[0].CurrentState.Name' >/dev/null
+        ;;
       shutting-down|stopping) die "instance $INSTANCE_ID is $prior_state; wait and retry" ;;
       *) die "instance $INSTANCE_ID is $prior_state; cannot resume" ;;
     esac
@@ -912,8 +1230,16 @@ create_instance() {
     else
       root_mapping=(--block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"DeleteOnTermination":true,"VolumeType":"gp3"}}]')
     fi
-    INSTANCE_ID="$(aws_text ec2 run-instances --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --count 1 --subnet-id "$SUBNET_ID" --security-group-ids "$SG_ID" --key-name "$KEY_NAME" --associate-public-ip-address --metadata-options HttpEndpoint=enabled,HttpTokens=required --instance-initiated-shutdown-behavior stop --client-token "$INSTANCE_TOKEN" "${root_mapping[@]}" --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ManagedBy,Value=aws-ec2-vm}]" --query 'Instances[0].InstanceId')"
-    save_state
+    if result="$(aws_text ec2 run-instances --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --count 1 --subnet-id "$SUBNET_ID" --security-group-ids "$SG_ID" --key-name "$KEY_NAME" --associate-public-ip-address --metadata-options HttpEndpoint=enabled,HttpTokens=required --instance-initiated-shutdown-behavior stop --client-token "$INSTANCE_TOKEN" "${root_mapping[@]}" --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ManagedBy,Value=aws-ec2-vm}]" --query 'Instances[0].InstanceId' 2>&1)"; then
+      created_id="$result"
+      case "$created_id" in i-[a-zA-Z0-9]*) ;; *) die "run-instances returned an invalid instance ID: $created_id" ;; esac
+    else
+      warn "Instance launch returned an error; reconciling the saved client token before any retry: $result"
+    fi
+    reconcile_id="$created_id"
+    [ -z "$expected_instance_id" ] || reconcile_id="$expected_instance_id"
+    reconcile_instance_token "$reconcile_id" ||
+      die "instance token $INSTANCE_TOKEN remained absent after 3 reconciliation reads; retry create to replay only this exact client token"
     info "Created instance $INSTANCE_ID"
   fi
   "${AWS[@]}" ec2 wait instance-running --instance-ids "$INSTANCE_ID"
@@ -976,40 +1302,252 @@ configure_ollama_cidr() {
   OLLAMA_CIDR="$PORT_CIDR"
 }
 
-ollama_rules() {
-  aws_text ec2 describe-security-group-rules --filters "Name=group-id,Values=$SG_ID" \
-    --query "SecurityGroupRules[?IpProtocol==\`tcp\` && FromPort==\`$OLLAMA_PORT\` && ToPort==\`$OLLAMA_PORT\`].[SecurityGroupRuleId,CidrIpv4,Description]"
+security_group_scope() {
+  local result state groups extra group scope="$SG_ID"
+  [ -n "$SG_ID" ] || die "state has no security group"
+  case "$SG_ID" in sg-[a-zA-Z0-9]*) ;; *) die "saved security group ID is invalid: $SG_ID" ;; esac
+  if [ -n "$INSTANCE_ID" ] && [ "$SG_SKIP_INSTANCE_SCOPE" -eq 0 ]; then
+    if ! result="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].[State.Name,join(`,`,sort(NetworkInterfaces[].Groups[].GroupId))]' 2>&1)"; then
+      die "cannot inspect all network-interface security groups for $INSTANCE_ID: $result"
+    fi
+    read -r state groups extra <<< "$result"
+    [ -z "$extra" ] || die "AWS returned malformed network-interface security groups for $INSTANCE_ID"
+    case "$state" in
+      pending|running|shutting-down|stopping|stopped)
+        [ -n "$groups" ] && [ "$groups" != "None" ] || die "live instance $INSTANCE_ID has no security groups"
+        groups="${groups//,/ }"
+        for group in $groups; do
+          case "$group" in sg-[a-zA-Z0-9]*) ;; *) die "instance $INSTANCE_ID returned invalid security group ID: $group" ;; esac
+          case " $scope " in *" $group "*) ;; *) scope="$scope $group" ;; esac
+        done
+        case " $scope " in *" $SG_ID "*) ;; *) die "saved security group $SG_ID is not attached to live instance $INSTANCE_ID" ;; esac
+        case " $groups " in *" $SG_ID "*) ;; *) die "saved security group $SG_ID is not attached to live instance $INSTANCE_ID" ;; esac
+        ;;
+      terminated) ;;
+      *) die "AWS returned invalid instance state while inventorying security groups: $state" ;;
+    esac
+  fi
+  SG_SCOPE_CSV="${scope// /,}"
 }
 
-ensure_ollama_ingress() {
-  local rules owned_desired any_desired stale id remaining
-  local description="aws-ec2-vm:${NAME}:ollama:${OLLAMA_PORT}"
-  rules="$(ollama_rules)" || die "cannot inspect Ollama port rules in $SG_ID"
-  owned_desired="$(awk -F '\t' -v cidr="$OLLAMA_CIDR" -v description="$description" '$2 == cidr && $3 == description { print $1 }' <<< "$rules")"
-  any_desired="$(awk -F '\t' -v cidr="$OLLAMA_CIDR" '$2 == cidr { print $1 }' <<< "$rules")"
-  if [ -z "$owned_desired" ] && [ -n "$any_desired" ]; then
-    die "Ollama port $OLLAMA_PORT for $OLLAMA_CIDR already exists in an unowned rule; refusing to adopt or modify it"
+load_security_group_rule_inventory() {
+  local result
+  security_group_scope
+  if ! result="$(aws_text ec2 describe-security-group-rules --filters "Name=group-id,Values=$SG_SCOPE_CSV" --query "SecurityGroupRules[?IsEgress==\`false\`].[SecurityGroupRuleId,GroupId,IsEgress,IpProtocol,FromPort,ToPort,CidrIpv4,CidrIpv6,PrefixListId,ReferencedGroupInfo.GroupId,Description,Tags[?Key=='ManagedBy']|[0].Value,Tags[?Key=='aws-ec2-vm:Name']|[0].Value,Tags[?Key=='aws-ec2-vm:Purpose']|[0].Value,Tags[?Key=='aws-ec2-vm:Port']|[0].Value]" 2>&1)"; then
+    die "cannot inventory ingress rules across security groups $SG_SCOPE_CSV: $result"
   fi
-  if [ -z "$owned_desired" ]; then
-    if ! aws_text ec2 authorize-security-group-ingress --group-id "$SG_ID" --ip-permissions "IpProtocol=tcp,FromPort=$OLLAMA_PORT,ToPort=$OLLAMA_PORT,IpRanges=[{CidrIp=$OLLAMA_CIDR,Description=$description}]" >/dev/null; then
-      rules="$(ollama_rules)" || die "cannot inspect Ollama rules after authorize failed"
-      owned_desired="$(awk -F '\t' -v cidr="$OLLAMA_CIDR" -v description="$description" '$2 == cidr && $3 == description { print $1 }' <<< "$rules")"
-      [ -n "$owned_desired" ] || die "could not expose Ollama port $OLLAMA_PORT to $OLLAMA_CIDR"
-    fi
-  fi
-  rules="$(ollama_rules)" || die "cannot verify Ollama port rules"
-  owned_desired="$(awk -F '\t' -v cidr="$OLLAMA_CIDR" -v description="$description" '$2 == cidr && $3 == description { print $1 }' <<< "$rules")"
-  [ -n "$owned_desired" ] || die "new Ollama port rule could not be verified"
-  stale="$(awk -F '\t' -v cidr="$OLLAMA_CIDR" -v description="$description" '$2 != cidr && $3 == description { print $1 }' <<< "$rules")"
-  for id in $stale; do
-    if ! aws_text ec2 revoke-security-group-ingress --group-id "$SG_ID" --security-group-rule-ids "$id" >/dev/null; then
-      remaining="$(ollama_rules)" || die "cannot inspect Ollama rules after revoke failed"
-      if awk -F '\t' -v id="$id" '$1 == id { found=1 } END { exit !found }' <<< "$remaining"; then
-        die "could not revoke managed Ollama security group rule $id"
+  case "$result" in ''|None) SG_RULE_INVENTORY="" ;; *) SG_RULE_INVENTORY="$result" ;; esac
+}
+
+classify_security_group_rules() {
+  local port="$1" desired_cidr="$2" purpose="$3"
+  local id group egress protocol from_port to_port ipv4 ipv6 prefix referenced description managed owner_name owner_purpose owner_port extra
+  local source_count source_type source_value effective owned legacy_description details row
+  SG_DESIRED_IDS=""
+  SG_STALE_IDS=""
+  SG_OWNED_CIDRS=""
+  SG_CONFLICT_DETAILS=""
+  SG_EFFECTIVE_DETAILS=""
+  SG_DESIRED_COUNT=0
+  SG_OWNED_COUNT=0
+  SG_CONFLICT_COUNT=0
+  SG_EFFECTIVE_COUNT=0
+  case "$purpose" in
+    ssh) legacy_description="aws-ec2-vm" ;;
+    ollama) legacy_description="aws-ec2-vm:${NAME}:ollama:${port}" ;;
+    tcp) legacy_description="aws-ec2-vm:${NAME}:tcp:${port}" ;;
+    *) die "invalid managed ingress purpose: $purpose" ;;
+  esac
+  [ -z "$SG_RULE_INVENTORY" ] && return 0
+  while IFS= read -r row; do
+    [ "$(awk -F '\t' '{ print NF }' <<< "$row")" -eq 15 ] || die "security group rule inventory did not return exactly 15 columns"
+    IFS=$'\t' read -r id group egress protocol from_port to_port ipv4 ipv6 prefix referenced description managed owner_name owner_purpose owner_port extra <<< "$row"
+    [ -z "$extra" ] || die "security group rule inventory returned unexpected columns"
+    case "$id" in sgr-[a-zA-Z0-9]*) ;; *) die "security group inventory returned invalid rule ID: $id" ;; esac
+    case "$group" in sg-[a-zA-Z0-9]*) ;; *) die "security group rule $id has invalid group ID: $group" ;; esac
+    case ",$SG_SCOPE_CSV," in *",$group,"*) ;; *) die "security group rule $id belongs to a group outside the requested inventory: $group" ;; esac
+    case "$egress" in False|false) ;; *) die "security group rule $id is not valid ingress inventory" ;; esac
+    for source_value in ipv4 ipv6 prefix referenced description managed owner_name owner_purpose owner_port from_port to_port; do
+      case "$source_value" in
+        ipv4) [ "$ipv4" != "None" ] || ipv4="" ;;
+        ipv6) [ "$ipv6" != "None" ] || ipv6="" ;;
+        prefix) [ "$prefix" != "None" ] || prefix="" ;;
+        referenced) [ "$referenced" != "None" ] || referenced="" ;;
+        description) [ "$description" != "None" ] || description="" ;;
+        managed) [ "$managed" != "None" ] || managed="" ;;
+        owner_name) [ "$owner_name" != "None" ] || owner_name="" ;;
+        owner_purpose) [ "$owner_purpose" != "None" ] || owner_purpose="" ;;
+        owner_port) [ "$owner_port" != "None" ] || owner_port="" ;;
+        from_port) [ "$from_port" != "None" ] || from_port="" ;;
+        to_port) [ "$to_port" != "None" ] || to_port="" ;;
+      esac
+    done
+    source_count=0
+    source_type=""
+    source_value=""
+    if [ -n "$ipv4" ]; then source_count=$((source_count + 1)); source_type="ipv4"; source_value="$ipv4"; fi
+    if [ -n "$ipv6" ]; then source_count=$((source_count + 1)); source_type="ipv6"; source_value="$ipv6"; fi
+    if [ -n "$prefix" ]; then source_count=$((source_count + 1)); source_type="prefix-list"; source_value="$prefix"; fi
+    if [ -n "$referenced" ]; then source_count=$((source_count + 1)); source_type="referenced-group"; source_value="$referenced"; fi
+    [ "$source_count" -eq 1 ] || die "security group rule $id does not have exactly one supported source"
+    case "$source_type" in
+      ipv4) valid_cidr "$source_value" || die "security group rule $id has invalid IPv4 source: $source_value" ;;
+      ipv6)
+        case "$source_value" in ''|/*|*/|*/*/*|*[!0-9A-Fa-f:./]*) die "security group rule $id has invalid IPv6 source: $source_value" ;; esac
+        local ipv6_address="${source_value%/*}" ipv6_prefix="${source_value#*/}"
+        case "$ipv6_address" in *:*) ;; *) die "security group rule $id has invalid IPv6 source: $source_value" ;; esac
+        case "$ipv6_prefix" in ''|*[!0-9]*) die "security group rule $id has invalid IPv6 prefix: $source_value" ;; esac
+        [ "$ipv6_prefix" -le 128 ] || die "security group rule $id has invalid IPv6 prefix: $source_value"
+        ;;
+      prefix-list) case "$source_value" in pl-[a-zA-Z0-9]*) [ "$source_value" != "pl-" ] || die "security group rule $id has invalid prefix-list source" ;; *) die "security group rule $id has invalid prefix-list source: $source_value" ;; esac ;;
+      referenced-group) case "$source_value" in sg-[a-zA-Z0-9]*) ;; *) die "security group rule $id has invalid referenced-group source: $source_value" ;; esac ;;
+    esac
+    effective=0
+    case "$protocol" in
+      -1|6) effective=1 ;;
+      tcp)
+        case "$from_port:$to_port" in *[!0-9:]*|:*|*:) die "security group rule $id has malformed TCP range" ;; esac
+        [ "$from_port" -le 65535 ] && [ "$to_port" -le 65535 ] && [ "$from_port" -le "$to_port" ] ||
+          die "security group rule $id has invalid TCP range $from_port-$to_port"
+        if [ "$from_port" -le "$port" ] && [ "$to_port" -ge "$port" ]; then effective=1; fi
+        ;;
+      ''|None) die "security group rule $id has no protocol" ;;
+    esac
+    [ "$effective" -eq 1 ] || continue
+    SG_EFFECTIVE_COUNT=$((SG_EFFECTIVE_COUNT + 1))
+    details="$id(group=$group,source=$source_type:$source_value,protocol=$protocol,range=${from_port:-None}-${to_port:-None})"
+    SG_EFFECTIVE_DETAILS="${SG_EFFECTIVE_DETAILS}${SG_EFFECTIVE_DETAILS:+$'\n'}$details"
+    owned=0
+    if [ "$group" = "$SG_ID" ] && [ "$protocol" = "tcp" ] && [ "$from_port" = "$port" ] && [ "$to_port" = "$port" ] && [ "$source_type" = "ipv4" ]; then
+      if [ "$description" = "aws-ec2-vm:v2:${NAME}:${purpose}:${port}" ] && [ "$managed" = "aws-ec2-vm" ] &&
+        [ "$owner_name" = "$NAME" ] && [ "$owner_purpose" = "$purpose" ] && [ "$owner_port" = "$port" ]; then
+        owned=1
+      elif [ "$description" = "$legacy_description" ]; then
+        owned=1
       fi
     fi
+    if [ "$owned" -eq 1 ]; then
+      SG_OWNED_COUNT=$((SG_OWNED_COUNT + 1))
+      SG_OWNED_CIDRS="${SG_OWNED_CIDRS}${SG_OWNED_CIDRS:+$'\n'}$source_value"
+      if [ -n "$desired_cidr" ] && [ "$source_value" = "$desired_cidr" ]; then
+        SG_DESIRED_COUNT=$((SG_DESIRED_COUNT + 1))
+        SG_DESIRED_IDS="${SG_DESIRED_IDS}${SG_DESIRED_IDS:+$'\n'}$id"
+      else
+        SG_STALE_IDS="${SG_STALE_IDS}${SG_STALE_IDS:+$'\n'}$id"
+      fi
+    else
+      SG_CONFLICT_COUNT=$((SG_CONFLICT_COUNT + 1))
+      SG_CONFLICT_DETAILS="${SG_CONFLICT_DETAILS}${SG_CONFLICT_DETAILS:+$'\n'}$details"
+    fi
+  done <<< "$SG_RULE_INVENTORY"
+}
+
+read_and_classify_ingress() {
+  load_security_group_rule_inventory
+  classify_security_group_rules "$@"
+}
+
+die_on_ingress_conflicts() {
+  local port="$1"
+  [ "$SG_CONFLICT_COUNT" -eq 0 ] || die "unowned effective ingress conflicts with TCP port $port: $SG_CONFLICT_DETAILS"
+  [ "$SG_DESIRED_COUNT" -le 1 ] || die "multiple owned desired ingress rules exist for TCP port $port"
+}
+
+wait_for_desired_ingress() {
+  local port="$1" cidr="$2" purpose="$3" attempt=1
+  while [ "$attempt" -le 3 ]; do
+    read_and_classify_ingress "$port" "$cidr" "$purpose"
+    die_on_ingress_conflicts "$port"
+    [ "$SG_DESIRED_COUNT" -ne 1 ] || return 0
+    [ "$attempt" -eq 3 ] || reconciliation_sleep
+    attempt=$((attempt + 1))
   done
-  info "Ollama port $OLLAMA_PORT is exposed to $OLLAMA_CIDR"
+  return 1
+}
+
+security_group_inventory_has_rule() {
+  local wanted="$1" row_id remainder
+  [ -n "$SG_RULE_INVENTORY" ] || return 1
+  while IFS=$'\t' read -r row_id remainder; do
+    [ "$row_id" = "$wanted" ] && return 0
+  done <<< "$SG_RULE_INVENTORY"
+  return 1
+}
+
+wait_for_ingress_rule_absent() {
+  local id="$1" port="$2" cidr="$3" purpose="$4" allow_conflicts="$5" attempt=1
+  while [ "$attempt" -le 3 ]; do
+    read_and_classify_ingress "$port" "$cidr" "$purpose"
+    [ "$allow_conflicts" -eq 1 ] || die_on_ingress_conflicts "$port"
+    security_group_inventory_has_rule "$id" || return 0
+    [ "$attempt" -eq 3 ] || reconciliation_sleep
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+revoke_owned_ingress_rules() {
+  local ids="$1" port="$2" cidr="$3" purpose="$4" allow_conflicts="$5" id result
+  for id in $ids; do
+    result=""
+    if ! result="$(aws_text ec2 revoke-security-group-ingress --group-id "$SG_ID" --security-group-rule-ids "$id" 2>&1)"; then
+      warn "Revoke returned an error for owned ingress rule $id; verifying absence: $result"
+    fi
+    wait_for_ingress_rule_absent "$id" "$port" "$cidr" "$purpose" "$allow_conflicts" ||
+      die "owned ingress rule $id remained after revoke: ${result:-AWS reported success}"
+  done
+}
+
+verify_managed_ingress() {
+  local port="$1" cidr="$2" purpose="$3" attempt=1
+  while [ "$attempt" -le 3 ]; do
+    read_and_classify_ingress "$port" "$cidr" "$purpose"
+    die_on_ingress_conflicts "$port"
+    if [ "$SG_DESIRED_COUNT" -eq 1 ] && [ -z "$SG_STALE_IDS" ]; then return 0; fi
+    [ "$attempt" -eq 3 ] || reconciliation_sleep
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+ensure_managed_ingress() {
+  local port="$1" cidr="$2" purpose="$3" description result stale
+  cidr="$(canonicalize_cidr "$cidr")" || die "invalid managed ingress IPv4 CIDR: $cidr"
+  description="aws-ec2-vm:v2:${NAME}:${purpose}:${port}"
+  read_and_classify_ingress "$port" "$cidr" "$purpose"
+  die_on_ingress_conflicts "$port"
+  if [ "$SG_DESIRED_COUNT" -eq 0 ]; then
+    result=""
+    if ! result="$(aws_text ec2 authorize-security-group-ingress --group-id "$SG_ID" --ip-permissions "IpProtocol=tcp,FromPort=$port,ToPort=$port,IpRanges=[{CidrIp=$cidr,Description=$description}]" --tag-specifications "ResourceType=security-group-rule,Tags=[{Key=ManagedBy,Value=aws-ec2-vm},{Key=aws-ec2-vm:Name,Value=$NAME},{Key=aws-ec2-vm:Purpose,Value=$purpose},{Key=aws-ec2-vm:Port,Value=$port}]" 2>&1)"; then
+      warn "Authorize returned an error for TCP port $port; verifying exact desired rule: $result"
+    fi
+  fi
+  wait_for_desired_ingress "$port" "$cidr" "$purpose" ||
+    die "exact managed ingress for TCP port $port and $cidr did not appear after reconciliation${result:+: $result}"
+  stale="$SG_STALE_IDS"
+  [ -z "$stale" ] || revoke_owned_ingress_rules "$stale" "$port" "$cidr" "$purpose" 0
+  verify_managed_ingress "$port" "$cidr" "$purpose" ||
+    die "managed ingress for TCP port $port did not converge to exactly $cidr"
+}
+
+verify_no_effective_ingress() {
+  local port="$1" purpose="$2" attempt=1
+  while [ "$attempt" -le 3 ]; do
+    read_and_classify_ingress "$port" "" "$purpose"
+    [ "$SG_EFFECTIVE_COUNT" -ne 0 ] || return 0
+    [ "$attempt" -eq 3 ] || reconciliation_sleep
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+close_managed_ingress() {
+  local port="$1" purpose="$2" owned
+  read_and_classify_ingress "$port" "" "$purpose"
+  owned="$SG_STALE_IDS"
+  [ -z "$owned" ] || revoke_owned_ingress_rules "$owned" "$port" "" "$purpose" 1
+  verify_no_effective_ingress "$port" "$purpose" ||
+    die "TCP port $port still has effective ingress after removing owned rules: $SG_EFFECTIVE_DETAILS"
 }
 
 ensure_ollama_remote() {
@@ -1286,11 +1824,15 @@ ensure_ollama() {
     PORT="$OLLAMA_PORT"
     PORT_CIDR="$OLLAMA_CIDR"
   fi
+  PORT_CIDR="$(canonicalize_cidr "$PORT_CIDR")" || die "invalid Ollama IPv4 CIDR: $PORT_CIDR"
+  OLLAMA_CIDR="$PORT_CIDR"
   save_state
   state="$(instance_state)" || return 1
   validate_port_security_group "$state"
+  ensure_managed_ingress "$OLLAMA_PORT" "$OLLAMA_CIDR" ollama
   ensure_ollama_remote
-  ensure_ollama_ingress
+  ensure_managed_ingress "$OLLAMA_PORT" "$OLLAMA_CIDR" ollama
+  info "Ollama port $OLLAMA_PORT is exposed to $OLLAMA_CIDR"
   OLLAMA_READY="1"
   save_state
   print_ollama_endpoint
@@ -1311,21 +1853,65 @@ create_vm() {
   live_account="$(aws_text sts get-caller-identity --query Account)"
   [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "$live_account" ] || die "state belongs to AWS account $ACCOUNT_ID, but current credentials use $live_account"
   ACCOUNT_ID="$live_account"
-  if [ -z "$INSTANCE_ID" ] && [ -n "$INSTANCE_TOKEN" ]; then reconcile_instance_token; fi
+  if [ -z "$INSTANCE_ID" ] && [ -n "$INSTANCE_TOKEN" ]; then reconcile_instance_token || true; fi
   if [ -z "$INSTANCE_ID" ] && [ -n "$INSTANCE_TOKEN" ] && [ "$AMI_BINDINGS_PRESENT" -eq 0 ]; then bind_legacy_launch_state; fi
   if [ -z "$INSTANCE_ID" ] && [ -n "$INSTANCE_TOKEN" ] && [ "$MODEL_EXPLICIT" -eq 1 ] && [ "$OLLAMA_MODE" = "0" ]; then
     die "cannot change an unresolved legacy launch to Ollama mode; rerun without --model until token $INSTANCE_TOKEN is reconciled"
   fi
   if [ -n "$INSTANCE_ID" ]; then
     existing_state="$(instance_state)" || return 1
+    if [ "$existing_state" = "not-found" ] && [ -n "$INSTANCE_TOKEN" ] && [ "$INSTANCE_READY" = "0" ]; then
+      if reconcile_instance_token "$INSTANCE_ID"; then
+        existing_state="$(instance_state)" || return 1
+      fi
+    fi
+    case "$existing_state" in
+      pending|running|stopping|stopped|shutting-down)
+        if [ "$VERIFIED_INSTANCE_ID" != "$INSTANCE_ID" ]; then inspect_saved_instance_identity; fi
+        existing_state="$VALIDATED_INSTANCE_STATE"
+        ;;
+      terminated)
+        if [ "$VERIFIED_INSTANCE_ID" != "$INSTANCE_ID" ]; then
+          if [ "$INSTANCE_READY" = "0" ] && [ -z "$AMI_ID" ] && [ -z "$AMI_INSTANCE_TYPE" ] && [ -z "$AMI_GPU_CLASS" ] &&
+            [ -z "$INSTANCE_TOKEN" ] && [ -z "$AMI_INSTANCE_TOKEN" ]; then
+            inspect_terminated_instance_ownership
+          else
+            inspect_saved_instance_identity
+          fi
+        fi
+        existing_state="$VALIDATED_INSTANCE_STATE"
+        ;;
+    esac
+    case "$existing_state" in
+      stopping|shutting-down) die "VM '$NAME' instance $INSTANCE_ID is $existing_state; wait before resuming create" ;;
+    esac
     sync_live_instance_type "$existing_state"
     case "$existing_state" in
-      terminated|not-found|None|'')
+      terminated)
         AMI_ID=""
         AMI_INSTANCE_TYPE=""
         AMI_GPU_CLASS=""
         AMI_INSTANCE_TOKEN=""
         INSTANCE_TOKEN=""
+        VERIFIED_INSTANCE_ID=""
+        INSTANCE_ID=""
+        INSTANCE_READY="0"
+        PUBLIC_IP=""
+        PUBLIC_DNS=""
+        ;;
+      not-found|None|'')
+        if [ "$INSTANCE_READY" = "1" ] || [ -z "$INSTANCE_TOKEN" ]; then
+          AMI_ID=""
+          AMI_INSTANCE_TYPE=""
+          AMI_GPU_CLASS=""
+          AMI_INSTANCE_TOKEN=""
+          INSTANCE_TOKEN=""
+          VERIFIED_INSTANCE_ID=""
+          INSTANCE_ID=""
+          INSTANCE_READY="0"
+          PUBLIC_IP=""
+          PUBLIC_DNS=""
+        fi
         ;;
     esac
   fi
@@ -1381,10 +1967,16 @@ create_vm() {
   resolve_ami
   save_state
   ensure_key
+  if [ "$existing_state" = "not-found" ] && [ -n "$INSTANCE_ID" ] && [ -n "$INSTANCE_TOKEN" ] && [ "$INSTANCE_READY" = "0" ]; then
+    SG_SKIP_INSTANCE_SCOPE=1
+  fi
   ensure_security_group
+  SG_SKIP_INSTANCE_SCOPE=0
   info "Preparing persistent EBS storage"
   ensure_volume
   create_instance
+  ensure_managed_ingress 22 "$SSH_CIDR" ssh
+  info "SSH port 22 is restricted to $SSH_CIDR across all attached security groups"
   if [ "$OLLAMA_MODE" = "1" ]; then ensure_ollama; fi
   INSTANCE_READY="1"
   save_state
@@ -1408,25 +2000,99 @@ instance_state() {
   fi
 }
 
-reconcile_instance_token() {
-  local result count recovered_id recovered_type recovered_ami
-  result="$(aws_text ec2 describe-instances --filters "Name=client-token,Values=$INSTANCE_TOKEN" --query 'Reservations[].Instances[].[InstanceId,InstanceType,ImageId]')" ||
-    die "cannot reconcile saved launch token $INSTANCE_TOKEN"
-  case "$result" in ''|None) return ;; esac
+validate_instance_identity_row() {
+  local row="$1" expected_id="$2" context="$3"
+  local recovered_id recovered_type recovered_ami recovered_subnet recovered_az recovered_key recovered_token recovered_state recovered_groups name_tag managed_by extra
+  local expected_type expected_token group_id
+  local -a recovered_group_ids=()
+  read -r recovered_id recovered_type recovered_ami recovered_subnet recovered_az recovered_key recovered_token recovered_state recovered_groups name_tag managed_by extra <<< "$row"
+  case "$recovered_id" in i-[a-zA-Z0-9]*) ;; *) die "$context returned an invalid instance ID: $recovered_id" ;; esac
+  case "$recovered_ami" in ami-[a-zA-Z0-9]*) ;; *) die "$context returned an invalid AMI ID: $recovered_ami" ;; esac
+  case "$recovered_state" in pending|running|shutting-down|terminated|stopping|stopped) ;; *) die "$context returned invalid instance state: $recovered_state" ;; esac
+  expected_type="${AMI_INSTANCE_TYPE:-${SAVED_INSTANCE_TYPE:-$INSTANCE_TYPE}}"
+  expected_token="${INSTANCE_TOKEN:-$AMI_INSTANCE_TOKEN}"
+  [ -n "$AMI_ID" ] && [ -n "$expected_type" ] && [ -n "$SUBNET_ID" ] && [ -n "$AZ" ] && [ -n "$KEY_NAME" ] && [ -n "$SG_ID" ] ||
+    die "$context lacks complete immutable launch identity"
+  [ -z "$INSTANCE_TOKEN" ] || [ -z "$AMI_INSTANCE_TOKEN" ] || [ "$AMI_INSTANCE_TOKEN" = "$INSTANCE_TOKEN" ] ||
+    die "saved AMI binding token $AMI_INSTANCE_TOKEN conflicts with launch token $INSTANCE_TOKEN"
+  if [ "$INSTANCE_READY" = "0" ]; then
+    [ -n "$INSTANCE_TOKEN" ] || die "$context has no primary saved client token for partial-instance validation"
+    expected_token="$INSTANCE_TOKEN"
+  fi
+  IFS=',' read -r -a recovered_group_ids <<< "$recovered_groups"
+  [ "${#recovered_group_ids[@]}" -gt 0 ] || die "$context has no security groups"
+  for group_id in "${recovered_group_ids[@]}"; do
+    [ "$group_id" = "$SG_ID" ] || die "$context has a conflicting security group set"
+  done
+  [ -z "$extra" ] && [ "$recovered_type" = "$expected_type" ] && [ "$recovered_ami" = "$AMI_ID" ] &&
+    [ "$recovered_subnet" = "$SUBNET_ID" ] && [ "$recovered_az" = "$AZ" ] && [ "$recovered_key" = "$KEY_NAME" ] &&
+    { [ -z "$expected_token" ] || [ "$recovered_token" = "$expected_token" ]; } &&
+    [ "$name_tag" = "$NAME" ] && [ "$managed_by" = "aws-ec2-vm" ] ||
+    die "$context does not exactly match saved launch identity and ownership"
+  [ -z "$expected_id" ] || [ "$recovered_id" = "$expected_id" ] ||
+    die "$context resolved to $recovered_id, expected saved instance $expected_id"
+  VALIDATED_INSTANCE_ID="$recovered_id"
+  VALIDATED_INSTANCE_TYPE="$recovered_type"
+  VALIDATED_INSTANCE_STATE="$recovered_state"
+}
+
+inspect_instance_token_once() {
+  local expected_id="${1:-}" result count
+  if ! result="$(aws_text ec2 describe-instances --filters "Name=client-token,Values=$INSTANCE_TOKEN" --query 'Reservations[].Instances[].[InstanceId,InstanceType,ImageId,SubnetId,Placement.AvailabilityZone,KeyName,ClientToken,State.Name,join(`,`,sort(NetworkInterfaces[].Groups[].GroupId)),Tags[?Key==`Name`]|[0].Value,Tags[?Key==`ManagedBy`]|[0].Value]' 2>&1)"; then
+    die "cannot reconcile saved launch token $INSTANCE_TOKEN: $result"
+  fi
+  case "$result" in ''|None) return 1 ;; esac
   count="$(printf '%s\n' "$result" | awk 'NF { count++ } END { print count + 0 }')"
   [ "$count" -eq 1 ] || die "saved launch token $INSTANCE_TOKEN matched $count instances; refusing ambiguous recovery"
-  read -r recovered_id recovered_type recovered_ami <<< "$result"
-  case "$recovered_id" in i-*) ;; *) die "saved launch token returned an invalid instance ID: $recovered_id" ;; esac
-  [ -n "$recovered_type" ] && [ "$recovered_type" != "None" ] || die "saved launch token returned no instance type"
-  case "$recovered_ami" in ami-*) ;; *) die "saved launch token returned an invalid AMI ID: $recovered_ami" ;; esac
-  INSTANCE_ID="$recovered_id"
-  AMI_ID="$recovered_ami"
-  AMI_INSTANCE_TYPE="$recovered_type"
-  AMI_GPU_CLASS=""
+  validate_instance_identity_row "$result" "$expected_id" "token $INSTANCE_TOKEN"
+  INSTANCE_ID="$VALIDATED_INSTANCE_ID"
+  AMI_INSTANCE_TYPE="$VALIDATED_INSTANCE_TYPE"
   AMI_INSTANCE_TOKEN="$INSTANCE_TOKEN"
   AMI_BINDINGS_PRESENT=1
-  save_state
-  info "Recovered instance $INSTANCE_ID from saved launch token"
+  VERIFIED_INSTANCE_ID="$INSTANCE_ID"
+}
+
+inspect_saved_instance_identity() {
+  local result count
+  if ! result="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[].Instances[].[InstanceId,InstanceType,ImageId,SubnetId,Placement.AvailabilityZone,KeyName,ClientToken,State.Name,join(`,`,sort(NetworkInterfaces[].Groups[].GroupId)),Tags[?Key==`Name`]|[0].Value,Tags[?Key==`ManagedBy`]|[0].Value]' 2>&1)"; then
+    die "cannot inspect exact identity of saved instance $INSTANCE_ID: $result"
+  fi
+  case "$result" in ''|None) die "saved instance $INSTANCE_ID returned an empty identity result" ;; esac
+  count="$(printf '%s\n' "$result" | awk 'NF { count++ } END { print count + 0 }')"
+  [ "$count" -eq 1 ] || die "saved instance $INSTANCE_ID returned $count identity rows"
+  validate_instance_identity_row "$result" "$INSTANCE_ID" "saved instance $INSTANCE_ID"
+  VERIFIED_INSTANCE_ID="$INSTANCE_ID"
+}
+
+inspect_terminated_instance_ownership() {
+  local result recovered_id recovered_state name_tag managed_by extra
+  if ! result="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[].Instances[].[InstanceId,State.Name,Tags[?Key==`Name`]|[0].Value,Tags[?Key==`ManagedBy`]|[0].Value]' 2>&1)"; then
+    die "cannot inspect ownership of terminated saved instance $INSTANCE_ID: $result"
+  fi
+  case "$result" in ''|None) die "terminated saved instance $INSTANCE_ID returned an empty ownership result" ;; esac
+  [ "$(printf '%s\n' "$result" | awk 'NF { count++ } END { print count + 0 }')" -eq 1 ] ||
+    die "terminated saved instance $INSTANCE_ID returned ambiguous ownership"
+  read -r recovered_id recovered_state name_tag managed_by extra <<< "$result"
+  [ -z "$extra" ] && [ "$recovered_id" = "$INSTANCE_ID" ] && [ "$recovered_state" = "terminated" ] &&
+    [ "$name_tag" = "$NAME" ] && [ "$managed_by" = "aws-ec2-vm" ] ||
+    die "terminated saved instance $INSTANCE_ID does not have exact ownership"
+  VALIDATED_INSTANCE_ID="$recovered_id"
+  VALIDATED_INSTANCE_STATE="$recovered_state"
+  VERIFIED_INSTANCE_ID="$INSTANCE_ID"
+}
+
+reconcile_instance_token() {
+  local expected_id="${1:-}" attempt=1
+  while [ "$attempt" -le 3 ]; do
+    if inspect_instance_token_once "$expected_id"; then
+      save_state
+      info "Recovered instance $INSTANCE_ID from saved launch token"
+      return 0
+    fi
+    [ "$attempt" -eq 3 ] || reconciliation_sleep
+    attempt=$((attempt + 1))
+  done
+  return 1
 }
 
 bind_legacy_launch_state() {
@@ -1475,54 +2141,45 @@ prepare_existing() {
 }
 
 validate_port_security_group() {
-  local instance_status="$1" details actual_vpc managed attached
+  local instance_status="$1"
   [ -n "$SG_ID" ] || die "state has no security group"
   [ -n "$VPC_ID" ] || die "state has no VPC"
-  details="$(aws_text ec2 describe-security-groups --group-ids "$SG_ID" --query "SecurityGroups[0].[VpcId,Tags[?Key=='ManagedBy']|[0].Value]" 2>/dev/null || true)"
-  read -r actual_vpc managed <<< "$details"
-  [ "$actual_vpc" = "$VPC_ID" ] || die "saved security group $SG_ID is not in saved VPC $VPC_ID"
-  [ "$managed" = "aws-ec2-vm" ] || die "saved security group $SG_ID is not managed by aws-ec2-vm"
-  case "$instance_status" in terminated|shutting-down|not-found|None|'') return ;; esac
-  attached="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].SecurityGroups[].GroupId')"
-  case " $attached " in *" $SG_ID "*) ;; *) die "saved security group $SG_ID is not attached to $INSTANCE_ID" ;; esac
+  inspect_security_group_id_once || die "saved security group $SG_ID no longer exists"
+  case "$instance_status" in
+    pending|running|shutting-down|stopping|stopped) security_group_scope ;;
+    terminated|not-found|None|'') ;;
+    *) die "instance $INSTANCE_ID has invalid state for security group validation: $instance_status" ;;
+  esac
 }
 
-port_rules() {
-  aws_text ec2 describe-security-group-rules --filters "Name=group-id,Values=$SG_ID" \
-    --query "SecurityGroupRules[?IpProtocol==\`tcp\` && FromPort==\`$PORT\` && ToPort==\`$PORT\`].[SecurityGroupRuleId,CidrIpv4,Description]"
+resolve_existing_ssh_cidr() {
+  if [ -n "$SSH_CIDR" ]; then
+    SSH_CIDR="$(canonicalize_cidr "$SSH_CIDR")" || die "invalid SSH IPv4 CIDR: $SSH_CIDR"
+    return
+  fi
+  read_and_classify_ingress 22 "" ssh
+  [ "$SG_CONFLICT_COUNT" -eq 0 ] || die "cannot recover SSH access while unowned effective port 22 ingress exists: $SG_CONFLICT_DETAILS"
+  [ "$SG_EFFECTIVE_COUNT" -eq 1 ] && [ "$SG_OWNED_COUNT" -eq 1 ] ||
+    die "cannot recover SSH CIDR: port 22 must have exactly one effective, exactly owned IPv4 rule"
+  case "$SG_OWNED_CIDRS" in ''|*$'\n'*) die "cannot recover a unique owned SSH CIDR" ;; esac
+  SSH_CIDR="$(canonicalize_cidr "$SG_OWNED_CIDRS")" || die "owned SSH rule returned an invalid IPv4 CIDR: $SG_OWNED_CIDRS"
 }
 
-owned_port_rule_ids() {
-  local rules="$1" cidr="${2:-}" description="aws-ec2-vm:${NAME}:tcp:${PORT}"
-  awk -F '\t' -v cidr="$cidr" -v description="$description" \
-    '$3 == description && (cidr == "" || $2 == cidr) { print $1 }' <<< "$rules"
-}
-
-cidr_port_rule_ids() {
-  awk -F '\t' -v cidr="$2" '$2 == cidr { print $1 }' <<< "$1"
-}
-
-stale_owned_port_rule_ids() {
-  local description="aws-ec2-vm:${NAME}:tcp:${PORT}"
-  awk -F '\t' -v cidr="$2" -v description="$description" \
-    '$3 == description && $2 != cidr { print $1 }' <<< "$1"
-}
-
-revoke_owned_port_rules() {
-  local ids="$1" id remaining
-  for id in $ids; do
-    if ! aws_text ec2 revoke-security-group-ingress --group-id "$SG_ID" --security-group-rule-ids "$id" >/dev/null; then
-      remaining="$(port_rules)" || die "cannot inspect TCP port $PORT rules after revoke failed"
-      if owned_port_rule_ids "$remaining" | grep -Fxq "$id"; then
-        die "could not revoke managed security group rule $id"
-      fi
-    fi
-  done
+preflight_existing_instance_ingress() {
+  local instance_status="$1"
+  validate_port_security_group "$instance_status"
+  resolve_existing_ssh_cidr
+  ensure_managed_ingress 22 "$SSH_CIDR" ssh
+  if [ "$OLLAMA_MODE" = "1" ]; then
+    [ -n "$OLLAMA_CIDR" ] || die "Ollama mode has no persisted ingress CIDR; refusing to start the instance"
+    OLLAMA_CIDR="$(canonicalize_cidr "$OLLAMA_CIDR")" || die "persisted Ollama IPv4 CIDR is invalid: $OLLAMA_CIDR"
+    ensure_managed_ingress "$OLLAMA_PORT" "$OLLAMA_CIDR" ollama
+  fi
 }
 
 expose_port() {
   prepare_existing
-  local state rules owned_desired any_desired stale description host
+  local state host
   state="$(instance_state)" || return 1
   case "$state" in
     running|stopped) ;;
@@ -1530,28 +2187,7 @@ expose_port() {
   esac
   validate_port_security_group "$state"
   discover_port_cidr
-  description="aws-ec2-vm:${NAME}:tcp:${PORT}"
-  rules="$(port_rules)" || die "cannot inspect TCP port $PORT rules in $SG_ID"
-  owned_desired="$(owned_port_rule_ids "$rules" "$PORT_CIDR")"
-  any_desired="$(cidr_port_rule_ids "$rules" "$PORT_CIDR")"
-  if [ -z "$owned_desired" ] && [ -n "$any_desired" ]; then
-    die "TCP port $PORT for $PORT_CIDR already exists in an unowned rule; refusing to adopt or modify it"
-  fi
-  if [ -z "$owned_desired" ]; then
-    if ! aws_text ec2 authorize-security-group-ingress --group-id "$SG_ID" --ip-permissions "IpProtocol=tcp,FromPort=$PORT,ToPort=$PORT,IpRanges=[{CidrIp=$PORT_CIDR,Description=$description}]" >/dev/null; then
-      rules="$(port_rules)" || die "cannot inspect TCP port $PORT rules after authorize failed"
-      owned_desired="$(owned_port_rule_ids "$rules" "$PORT_CIDR")"
-      [ -n "$owned_desired" ] || die "could not expose TCP port $PORT to $PORT_CIDR"
-    else
-      rules="$(port_rules)" || die "cannot verify newly exposed TCP port $PORT"
-      owned_desired="$(owned_port_rule_ids "$rules" "$PORT_CIDR")"
-      [ -n "$owned_desired" ] || die "new TCP port $PORT rule could not be verified"
-    fi
-  else
-    info "TCP port $PORT is already exposed to $PORT_CIDR"
-  fi
-  stale="$(stale_owned_port_rule_ids "$rules" "$PORT_CIDR")"
-  [ -z "$stale" ] || revoke_owned_port_rules "$stale"
+  ensure_managed_ingress "$PORT" "$PORT_CIDR" tcp
   info "Exposed TCP port $PORT to $PORT_CIDR"
   if [ "$state" = "running" ]; then
     refresh_public_ip
@@ -1564,16 +2200,10 @@ expose_port() {
 
 close_port() {
   prepare_existing
-  local state rules ids
+  local state
   state="$(instance_state)" || return 1
   validate_port_security_group "$state"
-  rules="$(port_rules)" || die "cannot inspect TCP port $PORT rules in $SG_ID"
-  ids="$(owned_port_rule_ids "$rules")"
-  if [ -z "$ids" ]; then
-    info "TCP port $PORT has no managed exposure"
-    return
-  fi
-  revoke_owned_port_rules "$ids"
+  close_managed_ingress "$PORT" tcp
   info "Closed managed TCP port $PORT"
 }
 
@@ -1590,16 +2220,23 @@ status_vm() {
 
 start_vm() {
   prepare_existing
-  local state
+  local state was_running=0
   state="$(instance_state)" || return 1
   case "$state" in
-    running) info "$INSTANCE_ID is already running" ;;
-    stopped) aws_text ec2 start-instances --instance-ids "$INSTANCE_ID" --query 'StartingInstances[0].CurrentState.Name' >/dev/null; "${AWS[@]}" ec2 wait instance-running --instance-ids "$INSTANCE_ID" ;;
+    running) was_running=1 ;;
+    stopped) ;;
     terminated|shutting-down|not-found|None) die "instance is $state; run '$0 create $NAME' to reuse persistent storage" ;;
     *) die "instance is $state; wait and retry" ;;
   esac
+  preflight_existing_instance_ingress "$state"
+  if [ "$state" = "stopped" ]; then
+    aws_text ec2 start-instances --instance-ids "$INSTANCE_ID" --query 'StartingInstances[0].CurrentState.Name' >/dev/null
+    "${AWS[@]}" ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+  fi
+  ensure_managed_ingress 22 "$SSH_CIDR" ssh
   refresh_public_ip
   if [ "$OLLAMA_MODE" = "1" ]; then ensure_ollama; fi
+  [ "$was_running" -eq 0 ] || info "$INSTANCE_ID is already running with verified ingress"
   print_commands
 }
 
@@ -1624,9 +2261,12 @@ restart_vm() {
   local state
   state="$(instance_state)" || return 1
   [ "$state" = "running" ] || die "instance is $state; use start instead"
+  preflight_existing_instance_ingress "$state"
   aws_text ec2 reboot-instances --instance-ids "$INSTANCE_ID" >/dev/null
-  info "Restart requested for $INSTANCE_ID"
+  ensure_managed_ingress 22 "$SSH_CIDR" ssh
+  if [ "$OLLAMA_MODE" = "1" ]; then ensure_managed_ingress "$OLLAMA_PORT" "$OLLAMA_CIDR" ollama; fi
   refresh_public_ip
+  info "Restart requested for $INSTANCE_ID after ingress verification"
   print_commands
 }
 
@@ -2835,7 +3475,7 @@ clean_preflight_volume() {
     clean_resource_not_found volume "$result" && return 0
     die "cannot verify ownership of volume $VOLUME_ID: $result"
   fi
-  case "$result" in ''|None) return 0 ;; esac
+  case "$result" in ''|None) die "exact volume ID lookup for $VOLUME_ID returned an empty result" ;; esac
   read -r resource_name managed_by <<< "$result"
   [ "$resource_name" = "$NAME-data" ] && [ "$managed_by" = "aws-ec2-vm" ] ||
     die "volume $VOLUME_ID is not owned by aws-ec2-vm name '$NAME-data'; refusing clean"
@@ -2859,7 +3499,7 @@ clean_preflight_security_group() {
     clean_resource_not_found security-group "$result" && return 0
     die "cannot verify ownership of security group $SG_ID: $result"
   fi
-  case "$result" in ''|None) return 0 ;; esac
+  case "$result" in ''|None) die "exact security group ID lookup for $SG_ID returned an empty result" ;; esac
   read -r group_name group_vpc resource_name managed_by <<< "$result"
   [ -n "$VPC_ID" ] && [ "$group_name" = "aws-vm-$NAME" ] && [ "$group_vpc" = "$VPC_ID" ] &&
     [ "$resource_name" = "aws-vm-$NAME" ] && [ "$managed_by" = "aws-ec2-vm" ] ||
@@ -2872,14 +3512,41 @@ clean_preflight_key() {
   if [ -z "$KEY_NAME" ] && [ -z "$KEY_PATH" ]; then return 0; fi
   [ "$KEY_NAME" = "aws-vm-$NAME" ] || die "saved key name is not the managed aws-vm-$NAME key; refusing clean"
   [ "$KEY_PATH" = "$STATE_DIR/keys/$NAME" ] || die "saved key path is not the exact managed key path; refusing clean"
-  local result
-  if ! result="$(aws_text ec2 describe-key-pairs --key-names "$KEY_NAME" --query 'KeyPairs[0].KeyName' 2>&1)"; then
-    clean_resource_not_found key-pair "$result" && return 0
-    die "cannot verify key pair $KEY_NAME: $result"
+  if inspect_key_pair_once 0; then CLEAN_KEY_PRESENT=1; fi
+}
+
+clean_reconcile_instance_intent() {
+  local expected_instance_id=""
+  [ -n "$INSTANCE_TOKEN" ] || return 0
+  [ -z "$CLEAN_INSTANCE_ID" ] || return 0
+  if [ -n "$INSTANCE_ID" ]; then
+    local state
+    expected_instance_id="$INSTANCE_ID"
+    state="$(instance_state)" || return 1
+    case "$state" in
+      not-found|None|'') [ "$INSTANCE_READY" = "0" ] || return 0 ;;
+      *) return 0 ;;
+    esac
   fi
-  case "$result" in ''|None) return 0 ;; esac
-  [ "$result" = "$KEY_NAME" ] || die "AWS returned an unexpected key pair for $KEY_NAME; refusing clean"
-  CLEAN_KEY_PRESENT=1
+  reconcile_instance_token "$expected_instance_id" ||
+    die "instance token $INSTANCE_TOKEN remained absent after 3 reconciliation reads; clean cannot prove whether launch was accepted"
+}
+
+clean_reconcile_volume_intent() {
+  [ -n "$VOLUME_TOKEN" ] || return 0
+  [ -z "$VOLUME_ID" ] || return 0
+  reconcile_volume_token ||
+    die "volume token $VOLUME_TOKEN remained absent after 3 reconciliation reads; clean cannot prove whether creation was accepted"
+}
+
+clean_refuse_legacy_unresolved_names() {
+  [ -z "$CLEAN_INSTANCE_ID" ] && [ "$INSTANCE_READY" = "0" ] || return 0
+  if [ -z "$SG_ID" ] && [ "$SG_CREATE_PENDING" = "0" ] && [ "$SG_CREATE_PENDING_PRESENT" = "0" ]; then
+    die "legacy partial state has no resolved security group identity; rerun create before clean"
+  fi
+  if [ -z "$KEY_NAME" ] && [ -z "$KEY_PATH" ] && [ "$KEY_IMPORT_PENDING" = "0" ] && [ "$KEY_IMPORT_PENDING_PRESENT" = "0" ]; then
+    die "legacy partial state has no resolved key identity; rerun create before clean"
+  fi
 }
 
 clean_delete_security_group() {
@@ -2919,7 +3586,11 @@ clean_vm() {
   local live_account result original_instance_id
   live_account="$(aws_text sts get-caller-identity --query Account)"
   [ "$live_account" = "$ACCOUNT_ID" ] || die "state belongs to AWS account $ACCOUNT_ID, but current credentials use $live_account"
-  if [ -z "$INSTANCE_ID" ] && [ -n "$INSTANCE_TOKEN" ] && [ -z "$CLEAN_INSTANCE_ID" ]; then reconcile_instance_token; fi
+  clean_reconcile_instance_intent
+  clean_reconcile_volume_intent
+  if [ "$SG_CREATE_PENDING" -eq 1 ]; then reconcile_pending_security_group; fi
+  if [ "$KEY_IMPORT_PENDING" -eq 1 ]; then reconcile_pending_key_import; fi
+  clean_refuse_legacy_unresolved_names
   clean_preflight_instance
   clean_preflight_volume
   clean_preflight_security_group
@@ -2943,15 +3614,9 @@ clean_vm() {
       fi
     fi
   fi
-  INSTANCE_ID=""
-  INSTANCE_TOKEN=""
   INSTANCE_READY="0"
   PUBLIC_IP=""
   PUBLIC_DNS=""
-  AMI_ID=""
-  AMI_INSTANCE_TYPE=""
-  AMI_GPU_CLASS=""
-  AMI_INSTANCE_TOKEN=""
   OLLAMA_READY="0"
   save_state
 
@@ -2973,6 +3638,7 @@ clean_vm() {
 
   if [ "$CLEAN_SG_PRESENT" -eq 1 ]; then clean_delete_security_group; fi
   SG_ID=""
+  SG_CREATE_PENDING="0"
   save_state
 
   if [ "$CLEAN_KEY_PRESENT" -eq 1 ]; then
@@ -2982,6 +3648,7 @@ clean_vm() {
   fi
   KEY_NAME=""
   KEY_PATH=""
+  KEY_IMPORT_PENDING="0"
   save_state
 
   remove_clean_file "$STATE_DIR/keys/$NAME"
