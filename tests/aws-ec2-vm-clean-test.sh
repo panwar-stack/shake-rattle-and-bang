@@ -79,13 +79,13 @@ case "$service:$operation" in
     ;;
   ec2:describe-key-pairs)
     if ! exists key-pair; then
-      printf '%s\n' 'An error occurred (InvalidKeyPair.NotFound) when calling the DescribeKeyPairs operation:' >&2
+      printf '%s\n' 'aws: [ERROR]: An error occurred (InvalidKeyPair.NotFound) when calling the DescribeKeyPairs operation: The key pair does not exist' >&2
       exit 255
     fi
     if [[ "$args" == *'KeyPairs[].KeyName'* ]]; then
       printf '%s\n' 'aws-vm-clean'
     else
-      printf 'aws-vm-clean\t%s\taws-vm-clean\taws-ec2-vm\n' "$(< "$MOCK_AWS_STATE/public-key")"
+      printf 'aws-vm-clean\t%s\n\taws-vm-clean\taws-ec2-vm\n' "$(< "$MOCK_AWS_STATE/public-key")"
     fi
     ;;
   ec2:terminate-instances)
@@ -440,6 +440,16 @@ run_vm "$state_dir" clean clean --yes
 assert_success 'clean is idempotent when all recorded AWS resources are already missing'
 assert_mutations_empty 'already-missing resources do not trigger destructive calls'
 assert_file_missing 'idempotent clean still removes completed local state' "$state_dir/clean.state"
+
+# A pending key import does not block cleanup when AWS confirms the key is absent.
+state_dir="$(new_fixture pending-key-missing)"
+printf '%s\n' 'KEY_IMPORT_PENDING=1' >> "$state_dir/clean.state"
+rm -f "$(dirname "$state_dir")/aws/instance" "$(dirname "$state_dir")/aws/volume" \
+  "$(dirname "$state_dir")/aws/security-group" "$(dirname "$state_dir")/aws/key-pair"
+run_vm "$state_dir" clean clean --yes
+assert_success 'clean removes pending local key state when the AWS key is missing'
+assert_mutations_empty 'missing pending key does not trigger an import or delete call'
+assert_file_missing 'pending key cleanup removes completed local state' "$state_dir/clean.state"
 
 # Successful stages are checkpointed so a retry resumes at the failed stage.
 state_dir="$(new_fixture retry)"

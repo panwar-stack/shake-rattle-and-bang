@@ -860,10 +860,12 @@ inspect_key_pair_once() {
   local require_tags="$1" result count row actual_name aws_public name_tag managed_by extra
   local expected_public aws_canonical
   if ! result="$(aws_text ec2 describe-key-pairs --key-names "$KEY_NAME" --include-public-key --query "KeyPairs[].[KeyName,PublicKey,Tags[?Key=='Name']|[0].Value,Tags[?Key=='ManagedBy']|[0].Value]" 2>&1)"; then
-    case "$result" in 'An error occurred (InvalidKeyPair.NotFound) when calling the DescribeKeyPairs operation:'*) return 1 ;; esac
+    case "$result" in *'An error occurred (InvalidKeyPair.NotFound) when calling the DescribeKeyPairs operation:'*) return 1 ;; esac
     die "cannot reconcile key pair $KEY_NAME: $result"
   fi
   case "$result" in ''|None) die "exact key-name lookup for $KEY_NAME returned an empty result" ;; esac
+  # AWS includes a trailing newline in imported PublicKey values, splitting one text row before the next tab-delimited field.
+  result="${result//$'\n\t'/$'\t'}"
   count="$(printf '%s\n' "$result" | awk 'NF { count++ } END { print count + 0 }')"
   [ "$count" -eq 1 ] || die "key name $KEY_NAME matched $count key pairs; refusing ambiguous recovery"
   row="$(printf '%s\n' "$result" | awk 'NF { print; exit }')"
@@ -905,7 +907,7 @@ reconcile_pending_key_import() {
 require_key_name_absent() {
   local result
   if ! result="$(aws_text ec2 describe-key-pairs --key-names "$KEY_NAME" --include-public-key --query 'KeyPairs[].KeyName' 2>&1)"; then
-    case "$result" in 'An error occurred (InvalidKeyPair.NotFound) when calling the DescribeKeyPairs operation:'*) return 0 ;; esac
+    case "$result" in *'An error occurred (InvalidKeyPair.NotFound) when calling the DescribeKeyPairs operation:'*) return 0 ;; esac
     die "cannot check key name $KEY_NAME before import: $result"
   fi
   case "$result" in ''|None) die "exact key-name lookup for $KEY_NAME returned an empty result" ;; esac
@@ -3590,7 +3592,6 @@ clean_vm() {
   clean_reconcile_instance_intent
   clean_reconcile_volume_intent
   if [ "$SG_CREATE_PENDING" -eq 1 ]; then reconcile_pending_security_group; fi
-  if [ "$KEY_IMPORT_PENDING" -eq 1 ]; then reconcile_pending_key_import; fi
   clean_refuse_legacy_unresolved_names
   clean_preflight_instance
   clean_preflight_volume
