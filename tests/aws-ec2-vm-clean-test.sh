@@ -7,6 +7,7 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/aws-ec2-vm-clean-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$TMP/bin" "$TMP/home"
+ssh-keygen -q -t ed25519 -N '' -C aws-vm-clean -f "$TMP/fixture-key"
 cat > "$TMP/bin/aws" <<'MOCK_AWS'
 #!/usr/bin/env bash
 set -eu
@@ -81,7 +82,11 @@ case "$service:$operation" in
       printf '%s\n' 'An error occurred (InvalidKeyPair.NotFound) when calling the DescribeKeyPairs operation:' >&2
       exit 255
     fi
-    printf '%s\n' 'aws-vm-clean'
+    if [[ "$args" == *'KeyPairs[].KeyName'* ]]; then
+      printf '%s\n' 'aws-vm-clean'
+    else
+      printf 'aws-vm-clean\t%s\taws-vm-clean\taws-ec2-vm\n' "$(< "$MOCK_AWS_STATE/public-key")"
+    fi
     ;;
   ec2:terminate-instances)
     mutation
@@ -109,6 +114,10 @@ case "$service:$operation" in
     require_arg --key-name aws-vm-clean
     [ ! -e "$MOCK_AWS_STATE/fail-delete-key-pair" ] || { printf '%s\n' 'injected delete-key-pair failure' >&2; exit 72; }
     rm -f "$MOCK_AWS_STATE/key-pair"
+    if exists inject-key-directory-on-delete; then
+      rm -f "$MOCK_AWS_STATE/../state/keys/clean"
+      mkdir "$MOCK_AWS_STATE/../state/keys/clean"
+    fi
     ;;
   *)
     printf 'Unexpected mock AWS call: %s %s %s\n' "$service" "$operation" "$args" >&2
@@ -246,8 +255,9 @@ new_fixture() {
   mkdir -p "$state_dir/keys" "$state_dir/known_hosts" "$state_dir/sshfs" "$aws_state"
   chmod 700 "$state_dir" "$state_dir/keys" "$state_dir/known_hosts" "$state_dir/sshfs"
   write_state "$state_dir" "$state_dir/keys/clean"
-  printf '%s\n' private > "$state_dir/keys/clean"
-  printf '%s\n' public > "$state_dir/keys/clean.pub"
+  cp "$TMP/fixture-key" "$state_dir/keys/clean"
+  cp "$TMP/fixture-key.pub" "$state_dir/keys/clean.pub"
+  ssh-keygen -y -f "$state_dir/keys/clean" > "$aws_state/public-key"
   printf '%s\n' host > "$state_dir/known_hosts/i-clean"
   printf '%s\n' config > "$state_dir/sshfs/clean-i-clean.conf"
   printf '%s\n' log > "$state_dir/sshfs/clean-i-clean.log"
@@ -456,8 +466,7 @@ assert_file_missing 'successful retry finally removes state' "$state_dir/clean.s
 
 # The key deletion is checkpointed before fallible local artifact cleanup.
 state_dir="$(new_fixture key-checkpoint)"
-rm -f "$state_dir/keys/clean"
-mkdir "$state_dir/keys/clean"
+touch "$(dirname "$state_dir")/aws/inject-key-directory-on-delete"
 run_vm "$state_dir" clean clean --yes
 assert_failure_contains 'unexpected local key directory fails after AWS cleanup' 'directory'
 assert_file_contains 'key name is checkpointed empty after AWS deletion' "$state_dir/clean.state" 'KEY_NAME='
