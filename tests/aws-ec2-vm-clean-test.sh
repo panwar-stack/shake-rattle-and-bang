@@ -34,20 +34,54 @@ require_arg() {
 
 case "$service:$operation" in
   sts:get-caller-identity)
-    printf '%s\n' '123456789012'
+    if exists wrong-account; then printf '%s\n' '999999999999'; else printf '%s\n' '123456789012'; fi
     ;;
   ec2:describe-instances)
     if [[ " $args " == *' --filters '* ]]; then
-      if exists instance; then printf '%s\n' 'i-clean t3.small ami-test'; else printf '%s\n' 'None'; fi
-    elif ! exists instance; then
-      printf '%s\n' 'An error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation:' >&2
-      exit 255
-    elif [[ "$args" == *Tags* ]]; then
-      if exists bad-instance-owner; then printf '%s\n' 'other aws-ec2-vm'; else printf '%s\n' 'clean aws-ec2-vm'; fi
+      if exists instance; then
+        printf 'i-clean\tt3.small\tami-test\tsubnet-test\tus-east-1a\taws-vm-clean\ttoken-test\trunning\tsg-deadbeef\tclean\taws-ec2-vm\n'
+      else
+        printf '%s\n' 'None'
+      fi
+    elif [[ " $args " == *' --no-paginate '* ]]; then
+      if exists transient-instance-state; then
+        attempts=0
+        [ ! -e "$MOCK_AWS_STATE/instance-state-attempts" ] || attempts="$(< "$MOCK_AWS_STATE/instance-state-attempts")"
+        attempts=$((attempts + 1))
+        printf '%s\n' "$attempts" > "$MOCK_AWS_STATE/instance-state-attempts"
+        if [ "$attempts" -lt 3 ]; then
+          if [ -s "$MOCK_AWS_STATE/transient-instance-state" ]; then
+            printf '%s\n' "$(< "$MOCK_AWS_STATE/transient-instance-state")" >&2
+          else
+            printf '%s\n' 'An error occurred (RequestLimitExceeded) when calling the DescribeInstances operation: Rate exceeded' >&2
+          fi
+          exit 255
+        fi
+      elif exists unauthorized-instance-state; then
+        printf '%s\n' 'An error occurred (UnauthorizedOperation) when calling the DescribeInstances operation: not authorized' >&2
+        exit 255
+      elif exists instance-lookup-output; then
+        while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done < "$MOCK_AWS_STATE/instance-lookup-output"
+        exit 0
+      elif exists zero-instance-result; then
+        printf '%s\n' 'None'
+        exit 0
+      elif exists empty-instance-result; then
+        exit 0
+      elif ! exists instance; then
+        printf '%s\n' 'An error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation:' >&2
+        exit 255
+      fi
+      if exists terminated-instance; then instance_state=terminated
+      elif exists shutting-down-instance; then instance_state=shutting-down
+      elif exists pending-instance; then instance_state=pending
+      elif exists stopping-instance; then instance_state=stopping
+      else instance_state=running
+      fi
+      if exists bad-instance-owner; then instance_name=other; else instance_name=clean; fi
+      printf 'i-clean\t%s\t%s\taws-ec2-vm\n' "$instance_state" "$instance_name"
     elif [[ "$args" == *InstanceType* ]]; then
       printf '%s\n' 't3.small'
-    elif exists terminated-instance; then
-      printf '%s\n' 'terminated'
     else
       printf '%s\n' 'running'
     fi
@@ -197,6 +231,19 @@ assert_log_lacks() {
   if ! grep -Fq -- "$pattern" "$TMP/aws.log"; then pass "$description"; else fail "$description" "unexpected AWS log entry containing: $pattern\n$(< "$TMP/aws.log")"; fi
 }
 
+assert_log_contains() {
+  local description="$1" pattern="$2"
+  tests=$((tests + 1))
+  if grep -Fq -- "$pattern" "$TMP/aws.log"; then pass "$description"; else fail "$description" "expected AWS log entry containing: $pattern\n$(< "$TMP/aws.log")"; fi
+}
+
+assert_log_count() {
+  local description="$1" expected="$2" pattern="$3" actual
+  tests=$((tests + 1))
+  actual="$(grep -Fc -- "$pattern" "$TMP/aws.log" 2>/dev/null || true)"
+  if [ "$actual" -eq "$expected" ]; then pass "$description"; else fail "$description" "expected $expected occurrences of '$pattern', got $actual\n$(< "$TMP/aws.log")"; fi
+}
+
 assert_mutations_in_order() {
   local description="$1" pattern line matched=0
   shift
@@ -278,10 +325,10 @@ run_vm() {
   : > "$TMP/aws.mutations"
   set +e
   if [ "${RUN_INPUT_SET:-0}" -eq 1 ]; then
-    output="$(printf '%s\n' "${RUN_INPUT:-}" | PATH="$TMP/bin:$PATH" HOME="$TMP/home" AWS_VM_STATE_DIR="$state_dir" \
+    output="$(printf '%s\n' "${RUN_INPUT:-}" | PATH="$TMP/bin:$PATH" HOME="$TMP/home" AWS_VM_STATE_DIR="$state_dir" AWS_VM_RECONCILE_SLEEP_SECONDS=0 \
       MOCK_AWS_STATE="$aws_state" MOCK_AWS_LOG="$TMP/aws.log" MOCK_AWS_MUTATIONS="$TMP/aws.mutations" "$SCRIPT" "$@" 2>&1)"
   else
-    output="$(PATH="$TMP/bin:$PATH" HOME="$TMP/home" AWS_VM_STATE_DIR="$state_dir" \
+    output="$(PATH="$TMP/bin:$PATH" HOME="$TMP/home" AWS_VM_STATE_DIR="$state_dir" AWS_VM_RECONCILE_SLEEP_SECONDS=0 \
       MOCK_AWS_STATE="$aws_state" MOCK_AWS_LOG="$TMP/aws.log" MOCK_AWS_MUTATIONS="$TMP/aws.mutations" "$SCRIPT" "$@" 2>&1)"
   fi
   status=$?
@@ -407,6 +454,124 @@ touch "$(dirname "$state_dir")/aws/wrong-volume-notfound"
 run_vm "$state_dir" clean clean --yes
 assert_failure_contains 'volume inspection rejects a security-group NotFound code' 'volume'
 assert_mutations_empty 'wrong resource NotFound code cannot authorize mutation'
+
+# Clean's exact structured instance lookup distinguishes absence, invalid responses, transient failures, and terminal states.
+state_dir="$(new_fixture missing-instance)"
+rm -f "$(dirname "$state_dir")/aws/instance"
+run_vm "$state_dir" clean clean --yes
+assert_success 'clean treats an exact instance NotFound as already terminated'
+assert_log_count 'exact instance NotFound is accepted without retry' 1 'ec2 describe-instances --instance-ids i-clean --no-paginate'
+assert_log_lacks 'missing instance is never sent to terminate-instances' 'terminate-instances'
+assert_file_missing 'missing-instance cleanup completes remaining resources and local state' "$state_dir/clean.state"
+
+for zero_kind in None empty; do
+  state_dir="$(new_fixture "zero-row-instance-$zero_kind")"
+  printf '%s\n' 'INSTANCE_READY=0' 'INSTANCE_TOKEN=' 'AMI_INSTANCE_TOKEN=' >> "$state_dir/clean.state"
+  case "$zero_kind" in
+    None) touch "$(dirname "$state_dir")/aws/zero-instance-result" ;;
+    empty) touch "$(dirname "$state_dir")/aws/empty-instance-result" ;;
+  esac
+  run_vm "$state_dir" clean clean --yes
+  assert_success "qwen-shaped $zero_kind instance result completes clean"
+  assert_log_count "$zero_kind instance absence requires three exact structured reads" 3 'ec2 describe-instances --instance-ids i-clean --no-paginate'
+  assert_mutation_count "$zero_kind instance absence skips instance mutation" 0 'terminate-instances'
+  assert_mutation_count "$zero_kind instance absence still deletes the independently verified volume" 1 'delete-volume'
+  assert_mutation_count "$zero_kind instance absence still deletes the independently verified security group" 1 'delete-security-group'
+  assert_mutation_count "$zero_kind instance absence still deletes the independently verified key pair" 1 'delete-key-pair'
+  assert_file_missing "$zero_kind instance absence removes completed local state" "$state_dir/clean.state"
+done
+
+state_dir="$(new_fixture zero-row-wrong-account)"
+printf '%s\n' 'INSTANCE_READY=0' 'INSTANCE_TOKEN=' 'AMI_INSTANCE_TOKEN=' >> "$state_dir/clean.state"
+touch "$(dirname "$state_dir")/aws/zero-instance-result" "$(dirname "$state_dir")/aws/wrong-account"
+run_vm "$state_dir" clean clean --yes
+assert_failure_contains 'zero-row absence is accepted only after exact account validation' 'state belongs to AWS account'
+assert_log_lacks 'account mismatch prevents the zero-row instance lookup' 'ec2 describe-instances'
+assert_mutations_empty 'account mismatch authorizes no AWS mutation'
+
+state_dir="$(new_fixture zero-row-with-token)"
+printf '%s\n' 'INSTANCE_READY=0' >> "$state_dir/clean.state"
+touch "$(dirname "$state_dir")/aws/zero-instance-result"
+rm -f "$(dirname "$state_dir")/aws/instance"
+run_vm "$state_dir" clean clean --yes
+assert_failure_contains 'zero-row partial launch with a client token requires reconciliation' 'cannot prove whether launch was accepted'
+assert_log_count 'token-bearing zero-row launch gets three exact ID reads' 3 'ec2 describe-instances --instance-ids i-clean --no-paginate'
+assert_log_count 'token-bearing zero-row launch gets three client-token reads' 3 'ec2 describe-instances --filters Name=client-token,Values=token-test'
+assert_mutations_empty 'unresolved client token authorizes no AWS mutation'
+assert_file_exists 'unresolved client token retains retry state' "$state_dir/clean.state"
+
+for invalid_lookup in malformed-columns carriage-return multiple-rows wrong-id wrong-state wrong-name wrong-manager; do
+  state_dir="$(new_fixture "invalid-instance-$invalid_lookup")"
+  case "$invalid_lookup" in
+    malformed-columns) lookup_output=$'i-clean\trunning\tclean' ;;
+    carriage-return) lookup_output=$'i-clean\trunning\tclean\taws-ec2-vm\runsafe' ;;
+    multiple-rows) lookup_output=$'i-clean\trunning\tclean\taws-ec2-vm\ni-unrelated\trunning\tclean\taws-ec2-vm' ;;
+    wrong-id) lookup_output=$'i-unrelated\trunning\tclean\taws-ec2-vm' ;;
+    wrong-state) lookup_output=$'i-clean\tmystery\tclean\taws-ec2-vm' ;;
+    wrong-name) lookup_output=$'i-clean\trunning\tother\taws-ec2-vm' ;;
+    wrong-manager) lookup_output=$'i-clean\trunning\tclean\tother' ;;
+  esac
+  printf '%s\n' "$lookup_output" > "$(dirname "$state_dir")/aws/instance-lookup-output"
+  run_vm "$state_dir" clean clean --yes
+  assert_failure_contains "$invalid_lookup structured instance result fails closed" 'instance'
+  assert_mutations_empty "$invalid_lookup structured instance result authorizes no AWS mutation"
+  assert_file_exists "$invalid_lookup structured instance result retains retry state" "$state_dir/clean.state"
+done
+
+state_dir="$(new_fixture instance-no-paginate)"
+run_vm "$state_dir" clean clean --yes
+assert_success 'clean uses the valid exact structured instance row'
+assert_log_contains 'exact instance lookup disables pagination' 'ec2 describe-instances --instance-ids i-clean --no-paginate'
+
+for transient_case in request-limit too-many-requests request-timeout connection-reset; do
+  state_dir="$(new_fixture "transient-instance-state-$transient_case")"
+  case "$transient_case" in
+    request-limit) transient_error='An error occurred (RequestLimitExceeded) when calling the DescribeInstances operation: Rate exceeded' ;;
+    too-many-requests) transient_error='An error occurred (TooManyRequestsException) when calling the DescribeInstances operation: Rate exceeded' ;;
+    request-timeout) transient_error='An error occurred (RequestTimeout) when calling the DescribeInstances operation: Request timed out' ;;
+    connection-reset) transient_error='Connection reset by peer' ;;
+  esac
+  printf '%s\n' "$transient_error" > "$(dirname "$state_dir")/aws/transient-instance-state"
+  run_vm "$state_dir" clean clean --yes
+  assert_success "clean recovers from bounded $transient_case instance-state failures"
+  assert_log_count "$transient_case structured inspection succeeds on the third read" 3 'ec2 describe-instances --instance-ids i-clean'
+  assert_mutation_count "$transient_case recovery still terminates the instance exactly once" 1 'terminate-instances'
+  assert_file_missing "$transient_case recovery completes cleanup and removes local state" "$state_dir/clean.state"
+done
+
+state_dir="$(new_fixture unauthorized-instance-state)"
+touch "$(dirname "$state_dir")/aws/unauthorized-instance-state"
+run_vm "$state_dir" clean clean --yes
+assert_failure_contains 'clean preserves a permanent instance inspection diagnostic' 'UnauthorizedOperation'
+assert_log_count 'permanent instance inspection error is attempted only once' 1 'ec2 describe-instances --instance-ids i-clean'
+assert_mutations_empty 'permanent instance inspection error authorizes no AWS mutation'
+assert_file_exists 'permanent instance inspection error retains retry state' "$state_dir/clean.state"
+
+state_dir="$(new_fixture terminated-instance)"
+touch "$(dirname "$state_dir")/aws/terminated-instance"
+run_vm "$state_dir" clean clean --yes
+assert_success 'clean accepts an exactly owned terminated instance tombstone'
+assert_mutation_count 'terminated tombstone is not terminated again' 0 'terminate-instances'
+assert_mutation_count 'terminated tombstone does not require an instance waiter' 0 'wait instance-terminated'
+assert_file_missing 'terminated tombstone cleanup removes completed local state' "$state_dir/clean.state"
+
+state_dir="$(new_fixture shutting-down-instance)"
+touch "$(dirname "$state_dir")/aws/shutting-down-instance"
+run_vm "$state_dir" clean clean --yes
+assert_success 'clean waits for an exactly owned shutting-down instance'
+assert_mutation_count 'shutting-down instance is not terminated again' 0 'terminate-instances'
+assert_mutation_count 'shutting-down instance is still awaited once' 1 'wait instance-terminated'
+assert_file_missing 'shutting-down cleanup removes completed local state' "$state_dir/clean.state"
+
+for transitional_state in pending stopping; do
+  state_dir="$(new_fixture "$transitional_state-instance")"
+  touch "$(dirname "$state_dir")/aws/${transitional_state}-instance"
+  run_vm "$state_dir" clean clean --yes
+  assert_success "clean handles an exactly owned $transitional_state instance"
+  assert_mutation_count "$transitional_state instance is terminated exactly once" 1 'terminate-instances'
+  assert_mutation_count "$transitional_state instance is awaited exactly once" 1 'wait instance-terminated'
+  assert_file_missing "$transitional_state cleanup removes completed local state" "$state_dir/clean.state"
+done
 
 # A full cleanup is ordered and removes only the named VM's exact artifacts.
 state_dir="$(new_fixture full)"

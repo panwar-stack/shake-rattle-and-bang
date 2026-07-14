@@ -3478,6 +3478,7 @@ confirm() {
 }
 
 CLEAN_INSTANCE_PRESENT=0
+CLEAN_INSTANCE_FOUND=0
 CLEAN_INSTANCE_STATE=""
 CLEAN_VOLUME_PRESENT=0
 CLEAN_SG_PRESENT=0
@@ -3486,6 +3487,28 @@ CLEAN_KEY_PRESENT=0
 clean_resource_not_found() {
   case "$1:$2" in
     instance:*InvalidInstanceID.NotFound*|volume:*InvalidVolume.NotFound*|security-group:*InvalidGroup.NotFound*|key-pair:*InvalidKeyPair.NotFound*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+clean_instance_inspection_retryable() {
+  case "$1" in
+    *'An error occurred (RequestLimitExceeded) when calling the DescribeInstances operation:'*|\
+    *'An error occurred (RequestThrottled) when calling the DescribeInstances operation:'*|\
+    *'An error occurred (RequestThrottledException) when calling the DescribeInstances operation:'*|\
+    *'An error occurred (TooManyRequestsException) when calling the DescribeInstances operation:'*|\
+    *'An error occurred (Throttling) when calling the DescribeInstances operation:'*|\
+    *'An error occurred (ThrottlingException) when calling the DescribeInstances operation:'*|\
+    *'An error occurred (InternalError) when calling the DescribeInstances operation:'*|\
+    *'An error occurred (InternalFailure) when calling the DescribeInstances operation:'*|\
+    *'An error occurred (ServiceUnavailable) when calling the DescribeInstances operation:'*|\
+    *'An error occurred (RequestTimeout) when calling the DescribeInstances operation:'*|\
+    *'An error occurred (RequestTimeoutException) when calling the DescribeInstances operation:'*|\
+    *'Could not connect to the endpoint URL:'*|\
+    *'Connect timeout on endpoint URL:'*|\
+    *'Read timeout on endpoint URL:'*|\
+    *'Connection reset by peer'*|\
+    *'Connection was closed before we received a valid response from endpoint URL:'*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -3592,21 +3615,79 @@ clean_refuse_active_mount() {
   done <<< "$mount_output"
 }
 
-clean_preflight_instance() {
+clean_inspect_instance() {
   CLEAN_INSTANCE_PRESENT=0
+  CLEAN_INSTANCE_FOUND=0
   CLEAN_INSTANCE_STATE=""
   [ -n "$INSTANCE_ID" ] || return 0
-  CLEAN_INSTANCE_STATE="$(instance_state)" || return 1
-  case "$CLEAN_INSTANCE_STATE" in not-found|None|'') return 0 ;; esac
-  local result resource_name managed_by
-  if ! result="$(aws_text ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].[Tags[?Key=='Name']|[0].Value,Tags[?Key=='ManagedBy']|[0].Value]" 2>&1)"; then
-    if clean_resource_not_found instance "$result"; then CLEAN_INSTANCE_STATE="not-found"; return 0; fi
-    die "cannot verify ownership of instance $INSTANCE_ID: $result"
-  fi
-  read -r resource_name managed_by <<< "$result"
-  [ "$resource_name" = "$NAME" ] && [ "$managed_by" = "aws-ec2-vm" ] ||
-    die "instance $INSTANCE_ID is not owned by aws-ec2-vm name '$NAME'; refusing clean"
-  [ "$CLEAN_INSTANCE_STATE" = "terminated" ] || CLEAN_INSTANCE_PRESENT=1
+  local attempt=1 stdout_file stderr_file result error line_count without_tabs tab_count
+  local returned_id returned_state resource_name managed_by
+  while [ "$attempt" -le 3 ]; do
+    umask 077
+    stdout_file="$(mktemp "$STATE_DIR/.clean-instance-stdout.XXXXXX")" || die "could not create secure clean inspection output"
+    stderr_file="$(mktemp "$STATE_DIR/.clean-instance-stderr.XXXXXX")" || {
+      rm -f -- "$stdout_file"
+      die "could not create secure clean inspection diagnostics"
+    }
+    if "${AWS[@]}" ec2 describe-instances --instance-ids "$INSTANCE_ID" --no-paginate \
+      --query 'Reservations[].Instances[].[InstanceId,State.Name,Tags[?Key==`Name`]|[0].Value,Tags[?Key==`ManagedBy`]|[0].Value]' \
+      --output text > "$stdout_file" 2> "$stderr_file"; then
+      result="$(< "$stdout_file")"
+      error="$(< "$stderr_file")"
+      line_count="$(awk 'END { print NR + 0 }' "$stdout_file")"
+      rm -f -- "$stdout_file" "$stderr_file"
+      [ -z "$error" ] || die "AWS wrote unexpected diagnostics while inspecting instance $INSTANCE_ID: $error"
+      case "$result:$line_count" in
+        :0|None:1)
+          if [ "$attempt" -eq 3 ]; then CLEAN_INSTANCE_STATE="not-found"; return 0; fi
+          reconciliation_sleep
+          attempt=$((attempt + 1))
+          continue
+          ;;
+      esac
+      case "$result" in *$'\n'*|*$'\r'*) die "exact instance ID lookup for $INSTANCE_ID returned malformed multiline output" ;; esac
+      without_tabs="${result//$'\t'/}"
+      tab_count=$((${#result} - ${#without_tabs}))
+      [ "$line_count" -eq 1 ] && [ "$tab_count" -eq 3 ] ||
+        die "exact instance ID lookup for $INSTANCE_ID returned malformed structured output"
+      IFS=$'\t' read -r returned_id returned_state resource_name managed_by <<< "$result"
+      [ "$returned_id" = "$INSTANCE_ID" ] ||
+        die "exact instance ID lookup for $INSTANCE_ID returned different instance $returned_id"
+      case "$returned_state" in
+        pending|running|shutting-down|terminated|stopping|stopped) ;;
+        *) die "exact instance ID lookup for $INSTANCE_ID returned invalid state: $returned_state" ;;
+      esac
+      [ "$resource_name" = "$NAME" ] && [ "$managed_by" = "aws-ec2-vm" ] ||
+        die "instance $INSTANCE_ID is not owned by aws-ec2-vm name '$NAME'; refusing clean"
+      CLEAN_INSTANCE_FOUND=1
+      CLEAN_INSTANCE_STATE="$returned_state"
+      [ "$CLEAN_INSTANCE_STATE" = "terminated" ] || CLEAN_INSTANCE_PRESENT=1
+      return 0
+    fi
+    result="$(< "$stdout_file")"
+    error="$(< "$stderr_file")"
+    line_count="$(awk 'END { print NR + 0 }' "$stdout_file")"
+    rm -f -- "$stdout_file" "$stderr_file"
+    [ "$line_count" -eq 0 ] && [ -z "$result" ] ||
+      die "failed exact instance ID lookup for $INSTANCE_ID returned unexpected stdout"
+    case "$error" in
+      *$'\n'*|*$'\r'*) ;;
+      'An error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation:'*)
+        CLEAN_INSTANCE_STATE="not-found"
+        return 0
+        ;;
+    esac
+    if clean_instance_inspection_retryable "$error" && [ "$attempt" -lt 3 ]; then
+      reconciliation_sleep
+      attempt=$((attempt + 1))
+      continue
+    fi
+    die "cannot inspect instance $INSTANCE_ID during clean: ${error:-AWS CLI returned no diagnostic}"
+  done
+}
+
+clean_preflight_instance() {
+  clean_inspect_instance
 }
 
 clean_preflight_volume() {
@@ -3662,13 +3743,10 @@ clean_reconcile_instance_intent() {
   [ -n "$INSTANCE_TOKEN" ] || return 0
   [ -z "$CLEAN_INSTANCE_ID" ] || return 0
   if [ -n "$INSTANCE_ID" ]; then
-    local state
+    [ "$INSTANCE_READY" = "0" ] || return 0
     expected_instance_id="$INSTANCE_ID"
-    state="$(instance_state)" || return 1
-    case "$state" in
-      not-found|None|'') [ "$INSTANCE_READY" = "0" ] || return 0 ;;
-      *) return 0 ;;
-    esac
+    clean_inspect_instance
+    [ "$CLEAN_INSTANCE_FOUND" -eq 0 ] || return 0
   fi
   reconcile_instance_token "$expected_instance_id" ||
     die "instance token $INSTANCE_TOKEN remained absent after 3 reconciliation reads; clean cannot prove whether launch was accepted"
