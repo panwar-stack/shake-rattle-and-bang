@@ -1150,6 +1150,7 @@ install -d -o root -g root -m 0755 /etc/systemd/system/ollama.service.d
 cat > /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf <<'EOF'
 [Service]
 Environment="OLLAMA_HOST=0.0.0.0:11434"
+Environment="OLLAMA_CONTEXT_LENGTH=65536"
 EOF
 chown root:root /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf
 chmod 0644 /etc/systemd/system/ollama.service.d/aws-ec2-vm.conf
